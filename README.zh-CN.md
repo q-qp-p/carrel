@@ -16,7 +16,7 @@ Carrel 是一个面向 AI 智能体的自托管知识库，自动完成文档解
 
 ## 核心功能
 
-[0.4.1 更新内容与升级步骤](docs/releases/0.4.1.zh-CN.md)
+[0.4.2 更新内容与升级步骤](docs/releases/0.4.2.zh-CN.md) — Light／Standard 双版本、容器部署与独立模型配置。
 
 - **多格式解析：** 支持 PDF、Word、PowerPoint、表格、图片、HTML、Markdown、Notebook、源代码及工作流文件，按文件格式采用相应的处理方式。[格式说明](docs/architecture.zh-CN.md#入库流程)。
 - **自动更新：** 定时发现文件变化，更新索引，并维护已启用的知识图谱。
@@ -44,7 +44,7 @@ flowchart LR
     A -->|补充检索| R
 ```
 
-Carrel 使用 MinerU 和原生解析器处理文档，通过 Qdrant 存储向量、OpenSearch 提供关键词检索、Neo4j 支持图谱查询，SQLite 记录文件和任务状态。模型服务可以部署在本地，也可以使用兼容的远程接口。完整流程见 [架构说明](docs/architecture.zh-CN.md)。
+Carrel 使用 MinerU 和原生解析器处理文档。Standard 使用 Qdrant、OpenSearch 和 Neo4j；Light 使用内嵌 LanceDB 与 DuckDB，两者均由 SQLite 记录文件和任务状态。模型服务独立部署，可使用本地或兼容的远程接口。完整流程见 [架构说明](docs/architecture.zh-CN.md)。
 
 ## 设计思路
 
@@ -54,15 +54,15 @@ Carrel 提供通用的知识存储、检索和证据接口。实体、关系和�
 
 ## 运行环境
 
-- Python 3.12+、Docker 25+ 和 Compose v2。
+- Docker 和 Compose v2；Python 应用及后台调度在容器中运行。
 - 文本向量接口；处理图片描述时需要视觉语言模型接口；启用建图时需要对话模型接口。
-- 运行配套的本地模型服务需要 NVIDIA GPU 和 NVIDIA Container Toolkit。文档解析也支持 CPU，资源需求取决于模型与资料规模。
+- GPU 解析需要 NVIDIA GPU 和 NVIDIA Container Toolkit。文档解析也支持 CPU，资源需求取决于解析器与资料规模。
 
 | 平台 | 部署方式 |
 |---|---|
-| Linux + NVIDIA GPU | GPU 解析，可选本地模型服务，使用 systemd 调度 |
+| Linux + NVIDIA GPU | GPU 解析，需要 NVIDIA Container Toolkit，容器内调度 |
 | Linux 无 GPU | CPU 解析，连接其他主机或供应商提供的模型接口 |
-| macOS + Docker Desktop | 容器使用 CPU，Python 应用在主机运行，需自行安排定时调度 |
+| macOS + Docker Desktop | CPU 解析与应用均在容器中运行，包含定时调度 |
 | Windows | 使用 WSL2，暂不支持原生 Windows 部署 |
 
 [部署实例](docs/example-setup.zh-CN.md) 介绍了作者在 NVIDIA DGX Spark 上的实际部署，以及更轻量的做法。
@@ -74,20 +74,26 @@ Carrel 提供通用的知识存储、检索和证据接口。实体、关系和�
 ```bash
 git clone https://github.com/FengZhenfei/carrel.git
 cd carrel
-./deploy.sh
+./deploy.sh --standard --build
+# 或选择内嵌存储：
+# ./deploy.sh --light --build
 ```
 
-脚本会检测运行环境，启动基础服务、安装 Python 应用并生成配置文件。在支持用户级 systemd 的 Linux 环境中，脚本还会安装服务和定时任务；其他环境则输出手动启动命令。首次启动需要下载解析模型。
+脚本是可选的快捷入口，负责生成 Compose 配置并启动应用、后台调度及所选依赖，也可以直接使用 Compose。首次启动会下载 MinerU 解析资源。详见[容器部署](deployment/compose/README.zh-CN.md)。
 
 ### 2. 配置模型接口
 
-编辑 `config/knowledge-base.env`，填写向量及可选重排接口的地址、模型名称和 API Key。在控制台“模型列表”中注册支持图片输入的对话接口，再为各库选择“多模态模型”，图片、图表理解和表格复核共用该选择。也可通过 `VLM_BASE_URL`、`VLM_MODEL_ID`、`VLM_API_KEY` 配置全局默认接口。
+**Standard** 使用 Qdrant、OpenSearch 和 Neo4j；**Light** 使用内嵌 LanceDB 与 DuckDB，
+不启动数据库容器。版本在部署目录中固定，两个版本均集成 MinerU。详见[存储版本说明](docs/storage.zh-CN.md)。
 
-如果使用配套的四个向量与重排模型，先准备模型权重，再运行 `./deploy.sh --with-local-models`。详见 [模型接口配置](docs/configuration.zh-CN.md#模型接口) 和 [本地模型部署](deployment/compose/README.md#local-model-servers-profile-local-models)。修改环境配置后，需要重启正在运行的应用服务。
+在「系统设置」中分别配置 LLM、Embedding 和 Reranker 的接口地址、模型 ID 与 API Key。
+注册支持图片输入的 LLM，再为各库选择「多模态模型」，图片、图表理解和表格复核共用该选择。
+模型可部署在自己的主机，也可使用云端接口；Carrel 不启动这些模型服务或下载其权重。
+详见[模型接口配置](docs/configuration.zh-CN.md#模型接口)。
 
 ### 3. 添加资料
 
-打开控制台 **http://127.0.0.1:9800**。将资料放入 `runtime/mirror/<目录名>/`，然后在控制台启用该目录。每个启用的目录对应一个知识库，文件由定时任务自动处理。
+打开控制台 **http://127.0.0.1:9800**。将资料放入 `data/runtime/mirror/<目录名>/`，然后在控制台启用该目录。每个启用的目录对应一个知识库，文件由定时任务自动处理。
 
 需要知识图谱时，先在控制台注册对话模型并填写“最大输入”，再为知识库选择模型并启用建图。首次检索前，可在控制台确认服务健康状态和任务进度。
 
@@ -117,8 +123,9 @@ curl -sS http://127.0.0.1:9810/search \
 | [运维与开发](docs/operations.zh-CN.md) | 控制台、命令行、定时任务、排障和测试 |
 | [测试适用范围](docs/testing.zh-CN.md) | 通用回归契约、部署专项检查与真实服务评测 |
 | [部署实例](docs/example-setup.zh-CN.md) | 作者在 DGX Spark 上的实际部署、负责同步资料的 Mac，以及更轻量的做法 |
-| [Docker Compose](deployment/compose/README.md) | 基础设施、模型权重和容器配置（英文） |
-| [systemd](deployment/systemd/README.md) | Linux 服务与定时任务（英文） |
+| [容器部署](deployment/compose/README.zh-CN.md) | 应用、数据库、MinerU 与持久化目录配置 |
+| [容器部署](deployment/compose/README.zh-CN.md) | 镜像、调度、数据持久化与更新 |
+| [systemd](deployment/systemd/README.md) | 源码部署服务与定时任务（英文） |
 
 ## 数据与访问
 

@@ -2243,7 +2243,7 @@ class GraphVersionRetentionTests(unittest.TestCase):
                     aliases[f"graph_003_{t}"] = names[(graph_version, t)]
                 return {"previous": previous, "targets": dict(aliases), "changed": True, "skipped": []}
 
-            with mock.patch.object(build_mod, "activate_graph_aliases", fake_activate), \
+            with mock.patch("kb_pipeline.storage.standard.qdrant.activate_graph_aliases", fake_activate), \
                     mock.patch.object(build_mod, "active_source_chunks", lambda s, src: []):
                 with self.assertRaisesRegex(ValueError, "already the active"):
                     build_mod.rollback_graph_version(settings, source_key="kb_003", source=source, graph_version=new, q=FakeQ())
@@ -2261,7 +2261,7 @@ class GraphVersionRetentionTests(unittest.TestCase):
                 self.assertEqual(db.unsuccessful_graph_versions(con, "kb_003"), {new})
             # refused when the target's workspace is gone: incremental appends replay from it
             (root / "graph" / "work" / "003" / old / "graph.json").unlink()
-            with mock.patch.object(build_mod, "activate_graph_aliases", fake_activate):
+            with mock.patch("kb_pipeline.storage.standard.qdrant.activate_graph_aliases", fake_activate):
                 with self.assertRaisesRegex(ValueError, "workspace"):
                     build_mod.rollback_graph_version(settings, source_key="kb_003", source=source, graph_version=new, q=FakeQ())
 
@@ -2430,7 +2430,7 @@ class GraphVersionRetentionTests(unittest.TestCase):
                 return {"previous": previous, "targets": dict(aliases), "changed": True, "skipped": []}
 
             def rollback(version, **kwargs):
-                with mock.patch.object(build_mod, "activate_graph_aliases", fake_activate), \
+                with mock.patch("kb_pipeline.storage.standard.qdrant.activate_graph_aliases", fake_activate), \
                         mock.patch.object(build_mod, "active_source_chunks", lambda s, src: []):
                     return build_mod.rollback_graph_version(settings, source_key="kb_003", source=source,
                                                             graph_version=version, q=FakeQ(), **kwargs)
@@ -2489,14 +2489,14 @@ class GraphVersionRetentionTests(unittest.TestCase):
             source = SimpleNamespace(kb_id="kb_1", collection="kb_1")
             from unittest import mock
 
-            with mock.patch.object(build_mod, "delete_old_graph_collections", interrupted):
+            with mock.patch("kb_pipeline.storage.standard.qdrant.delete_old_graph_collections", interrupted):
                 with self.assertRaises(build_mod.GraphBuildInterrupted):
                     build_mod.gc_graph_versions(settings, source, q=object(), graph_version="v-live")
 
             def broken(*args, **kwargs):
                 raise RuntimeError("qdrant down")
 
-            with mock.patch.object(build_mod, "delete_old_graph_collections", broken):
+            with mock.patch("kb_pipeline.storage.standard.qdrant.delete_old_graph_collections", broken):
                 out = build_mod.gc_graph_versions(settings, source, q=object(), graph_version="v-live")
             self.assertIn("graph_gc", out["errors"])                                 # an ordinary error is still only recorded
         source_text = _repo_file("app/kb_pipeline/graph/build.py")
@@ -2695,9 +2695,9 @@ class BuildGateTests(unittest.TestCase):
                 during()
             return source_, None
 
-        with mock.patch.object(build_mod, "qdrant_client", return_value=SimpleNamespace()), \
-                mock.patch.object(build_mod, "activate_graph_aliases", activate), \
-                mock.patch.object(build_mod, "drop_graph_aliases", lambda q, collection, types: []), \
+        with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=SimpleNamespace()), \
+                mock.patch("kb_pipeline.storage.standard.qdrant.activate_graph_aliases", activate), \
+                mock.patch("kb_pipeline.storage.standard.qdrant.drop_graph_aliases", lambda q, collection, types: []), \
                 mock.patch.object(schema_flow, "ensure_schema_before_build", prepare_labels):
             try:
                 out = build_mod.build_graph(settings, source_key=source.kb_id, source=source, graph_version=self.VERSION,
@@ -2725,7 +2725,7 @@ class BuildGateTests(unittest.TestCase):
                 return source_, None
 
             q = SimpleNamespace(get_collections=lambda: SimpleNamespace(collections=[]))
-            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+            with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=q), \
                     mock.patch.object(schema_flow, "ensure_schema_before_build", prepare_labels):
                 with self.assertRaises(build_mod.NoGraphCorpus):
                     build_mod.build_graph(settings, source_key=source.kb_id, source=source)
@@ -2742,7 +2742,7 @@ class BuildGateTests(unittest.TestCase):
             def stopped(settings_, source_, **kw):               # stopped by "Turn off knowledge graph" during label extraction
                 raise build_mod.GraphBuildInterrupted("Graph build interrupted by signal 15")
 
-            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+            with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=q), \
                     mock.patch.object(schema_flow, "ensure_schema_before_build", stopped):
                 with self.assertRaises(build_mod.GraphBuildInterrupted):
                     build_mod.build_graph(settings, source_key=source.kb_id, source=source)
@@ -2759,7 +2759,7 @@ class BuildGateTests(unittest.TestCase):
             # the configuration held by the process is stale: in the registry the graph is already off
             self._set(settings, source.kb_id, {"graph_enabled": False})
             q = SimpleNamespace(get_collections=lambda: SimpleNamespace(collections=[]))
-            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+            with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=q), \
                     mock.patch.object(schema_flow, "ensure_schema_before_build",
                                       side_effect=AssertionError("the graph is off, preparation must not start")):
                 with self.assertRaisesRegex(build_mod.GraphBuildInterrupted, "this build does not start"):
@@ -2773,7 +2773,7 @@ class BuildGateTests(unittest.TestCase):
                 return schema_flow.reload_source(settings_, source_), {"version_id": "v1", "origin": "auto_blank"}
 
             q = SimpleNamespace(get_collections=lambda: SimpleNamespace(collections=[]))
-            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+            with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=q), \
                     mock.patch.object(schema_flow, "ensure_schema_before_build", prepare_labels), \
                     mock.patch.object(build_mod, "prepare_graph_input", side_effect=AssertionError("the corpus must not be prepared")):
                 with self.assertRaisesRegex(build_mod.GraphBuildInterrupted, "The knowledge graph has been turned off"):
@@ -2833,7 +2833,7 @@ class BuildGateTests(unittest.TestCase):
         from kb_pipeline.graph import schema_flow
 
         def resume(build_mod, settings, source, prepare_labels, failure):
-            with mock.patch.object(build_mod, "qdrant_client", return_value=SimpleNamespace()), \
+            with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=SimpleNamespace()), \
                     mock.patch.object(schema_flow, "ensure_schema_before_build", prepare_labels), \
                     mock.patch.object(build_mod, "prepare_graph_input", side_effect=LookupError("start over from corpus preparation")):
                 with self.assertRaises(failure):
@@ -3376,7 +3376,7 @@ class GraphAutoResumeTests(unittest.TestCase):
                     time.sleep(5)                          # the signal handler raises here
 
                 probe = {"system_state": {"system": "stopping" if shutdown else "running"}, "shutdown": shutdown}
-                with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=q), \
                         mock.patch.object(build_mod, "_shutdown_probe", return_value=probe), \
                         mock.patch.object(schema_flow, "ensure_schema_before_build", stopped):
                     with self.assertRaises(build_mod.GraphBuildInterrupted):
@@ -3389,14 +3389,14 @@ class GraphAutoResumeTests(unittest.TestCase):
                 self.assertEqual(self._found(settings, source.kb_id) is not None, shutdown)
         with tempfile.TemporaryDirectory() as tmp:
             build_mod, settings, source = self._kb(tmp)
-            with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+            with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=q), \
                     mock.patch.object(build_mod, "_shutdown_probe", side_effect=AssertionError("no signal, no probe")), \
                     mock.patch.object(schema_flow, "ensure_schema_before_build",
                                       side_effect=build_mod.GraphBuildInterrupted("Graph build interrupted by signal 15")):
                 with self.assertRaises(build_mod.GraphBuildInterrupted):
                     build_mod.build_graph(settings, source_key=source.kb_id, source=source)
             self.assertNotIn("stopped_by", json.loads(self._row(settings, source.kb_id)["manifest_json"]))
-            with mock.patch.object(build_mod, "qdrant_client", return_value=q):
+            with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=q):
                 with self.assertRaises(Exception):
                     build_mod.build_graph(settings, source_key=source.kb_id, source=source, doc_ids=["d1"],
                                           activate_aliases=False, run_gc=False)
@@ -3436,7 +3436,7 @@ class GraphAutoResumeTests(unittest.TestCase):
                     return source_, None
 
                 probe = {"system_state": {"system": "stopping" if shutdown else "running"}, "shutdown": shutdown}
-                with mock.patch.object(build_mod, "qdrant_client", return_value=q), \
+                with mock.patch("kb_pipeline.storage.standard.vector_client", return_value=q), \
                         mock.patch.object(build_mod, "_shutdown_probe", return_value=probe), \
                         mock.patch.object(schema_flow, "ensure_schema_before_build", swallowed):
                     with self.assertRaises(Exception):

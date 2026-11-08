@@ -11,6 +11,7 @@ history 包含被治理规则隐藏的文档;status 表示查询范围,不裁定
 另有 /search 附带的「主体的一跳邻域」(neighborhoods):题目里点名的实体各列几条权重最高的关系,agent 看了再决定往哪走。
 列出来的是图谱里登记的内容(模型抽取的结果),不是资料里的完整清单。"""
 from __future__ import annotations
+from contextlib import nullcontext
 
 from kb_pipeline.chunking.context import payload_text
 
@@ -130,6 +131,8 @@ def resolve_entity(session: Any, kb_id: str, gv: str, *, entity_id: str | None, 
     id:现在的 id,或归并进来的成员原来的 id(ids;别名归并、更正文件强制合并之后,代表换了也查得到)。
     名字:标题 / 别名 / 外部编号,不分大小写、不计空格;外部编号「体系:编号」只给编号也算。
     不计空格:问题里写「Demo 365」、图里登记的是「Demo365」,这类只差空格的写法算同一个名字。"""
+    if getattr(session, "domain_reader", False):
+        return session.resolve(entity_id, name)
     if entity_id:
         rows = session.run(
             f"MATCH (e:Entity {{kb_id: $kb, graph_version: $gv, id: $id}}) RETURN {ENTITY_RETURN}", kb=kb_id, gv=gv, id=str(entity_id)).data()
@@ -174,6 +177,8 @@ def neighbor_rows(session: Any, kb_id: str, gv: str, entity_id: str, *, limit: i
                   direction: str, scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """一跳关系:谓语、方向、权重、对端实体、时间与状态;按权重降序,样板关系与引用类对端不要,按口径筛掉不算数的
     (scope 见 time_scope;不给就是现行)。"""
+    if getattr(session, "domain_reader", False):
+        return session.neighbor_rows(entity_id, limit, types, direction, scope or time_scope())
     scope = scope or time_scope()
     times = ", ".join(f"r.{k} AS {k}" for k in RELATION_TIME_FIELDS)
     rows = session.run(
@@ -214,6 +219,8 @@ def neighbor_kinds(session: Any, kb_id: str, gv: str, entity_id: str, *, directi
                    scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """这个实体各类关系(谓语)各有多少条,不受 limit 与谓语筛选限制,按同一口径数:一个实体常有上千条关系而一次只返回
     权重最高的几十条,调用方据此知道还有哪些种类可以按谓语去取,拿到的是不是全部也由它算出来。"""
+    if getattr(session, "domain_reader", False):
+        return session.neighbor_kinds(entity_id, direction, scope or time_scope())
     scope = scope or time_scope()
     rows = session.run(
         f"""
@@ -229,6 +236,8 @@ def neighbor_kinds(session: Any, kb_id: str, gv: str, entity_id: str, *, directi
 
 def fact_count(session: Any, kb_id: str, gv: str, entity_id: str, *, scope: dict[str, Any] | None = None) -> int:
     """这个实体名下登记了多少条限定事实(按同一口径数;调用方据此知道查事实接口有没有东西可取)。"""
+    if getattr(session, "domain_reader", False):
+        return session.fact_count(entity_id, scope or time_scope())
     scope = scope or time_scope()
     rows = session.run(f"MATCH (e:Entity {{kb_id: $kb, graph_version: $gv, id: $id}})-[:HAS_SPEC]->(f:Spec) "
                        f"WHERE {in_effect('f', observed='observed', scope=scope)} RETURN count(f) AS n",
@@ -239,6 +248,8 @@ def fact_count(session: Any, kb_id: str, gv: str, entity_id: str, *, scope: dict
 def attach_evidence(session: Any, kb_id: str, gv: str, rows: list[dict[str, Any]], *, per_relation: int = EVIDENCE_PER_RELATION) -> None:
     """Attach a few evidence chunks to each relation (back to the chunk snapshot via EVIDENCES ->
     CONTRIBUTES_TO), together with the locators /context needs."""
+    if getattr(session, "domain_reader", False):
+        return session.attach_evidence(rows, per_relation)
     rids = [str(r["relation_id"]) for r in rows if r.get("relation_id")]
     if not rids:
         return
@@ -263,6 +274,8 @@ def attach_evidence(session: Any, kb_id: str, gv: str, rows: list[dict[str, Any]
 
 
 def entity_docs(session: Any, kb_id: str, gv: str, entity_id: str, *, limit: int = 12) -> list[str]:
+    if getattr(session, "domain_reader", False):
+        return session.entity_docs(entity_id, limit)
     rows = session.run(
         "MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $id})-[:MENTIONED_IN]->(c:QdrantChunkSnapshot) "
         "WHERE c.rel_path IS NOT NULL RETURN DISTINCT c.rel_path AS rel_path LIMIT $limit", kb=kb_id, gv=gv, id=str(entity_id), limit=int(limit)).data()
@@ -270,9 +283,11 @@ def entity_docs(session: Any, kb_id: str, gv: str, entity_id: str, *, limit: int
 
 
 def point_payloads(q: Any, collection: str, point_ids: Iterable[Any], *, keys: list[str] | None = None,
-                   timeout: float | None = None) -> dict[str, dict[str, Any]]:
+                   timeout: float | None = None, store: Any = None) -> dict[str, dict[str, Any]]:
     """Payloads of source chunks in the main collection (locators and active state; keys names other payload keys
     to fetch instead); points the main collection does not have are absent from the result."""
+    if store is not None:
+        return store.payloads(collection, list(point_ids), active_only=False, timeout=timeout)
     ids = sorted({str(p) for p in point_ids if p})
     meta: dict[str, dict[str, Any]] = {}
     extra = {"timeout": max(1, math.ceil(float(timeout)))} if timeout else {}      # Qdrant takes whole seconds only
@@ -364,7 +379,7 @@ def _squash(text: Any) -> str:
 
 
 def locate_facts(q: Any, collections: dict[str, str], specs: list[dict[str, Any]], sources: list[dict[str, Any]], *,
-                 timeout: float | None = None) -> list[str]:
+                 timeout: float | None = None, store: Any = None) -> list[str]:
     """Give every fact of /search the chunks it rests on (EVIDENCE_PER_FACT at most): the locators /context needs,
     the place string and whether the chunk is still active, in the row shape of the facts endpoint's evidence. A
     fact comes from one extraction unit that may span several chunks, and extraction does not record which chunk
@@ -383,7 +398,7 @@ def locate_facts(q: Any, collections: dict[str, str], specs: list[dict[str, Any]
         want = {p for sp, pids in zip(specs, cited) if sp.get("kb_id") == kb for p in pids if p not in by_point}
         if want:
             try:
-                fetched.update(point_payloads(q, collection, want, keys=EVIDENCE_PAYLOAD_KEYS + ["text"], timeout=timeout))
+                fetched.update(point_payloads(q, collection, want, keys=EVIDENCE_PAYLOAD_KEYS + ["text"], timeout=timeout, **({"store": store} if store is not None else {})))
             except Exception as exc:
                 failed.add(kb)
                 degraded.append(f"{kb}:spec_evidence: {type(exc).__name__}")
@@ -423,7 +438,7 @@ def locate_facts(q: Any, collections: dict[str, str], specs: list[dict[str, Any]
     return degraded
 
 
-def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]], *, anchors: list[Any] | None = None) -> None:
+def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]], *, anchors: list[Any] | None = None, store: Any = None) -> None:
     """Chunk snapshot nodes carry no doc_id / chunk index / version; fill them in from the main
     collection by point_id so the evidence can be fed straight to /context; deactivated points are
     marked.
@@ -434,9 +449,9 @@ def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]], *, an
     entry (excerpt / excerpt_match) and the entry moves to the front; one taken from a picture chunk is marked
     visual=true."""
     ids = [ev.get("point_id") for r in rows for ev in r.get("evidence") or [] if ev.get("point_id")]
-    if not ids or q is None:
+    if not ids or (q is None and store is None):
         return
-    meta = point_payloads(q, collection, ids, keys=EVIDENCE_PAYLOAD_KEYS + EXCERPT_PAYLOAD_KEYS if anchors is not None else None)
+    meta = point_payloads(q, collection, ids, **({"store": store} if store is not None else {}), keys=EVIDENCE_PAYLOAD_KEYS + EXCERPT_PAYLOAD_KEYS if anchors is not None else None)
     for r in rows:
         best: tuple[tuple[bool, bool, int, bool, int], dict[str, Any], str, str, dict[str, Any]] | None = None
         for i, ev in enumerate(r.get("evidence") or []):
@@ -461,7 +476,7 @@ def backfill_evidence(q: Any, collection: str, rows: list[dict[str, Any]], *, an
 
 def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entity_id: str | None, limit: int = 20,
               types: list[str] | None = None, direction: str = "both", history: bool = False, as_of: str | None = None,
-              q: Any = None, expected_graph_version: str | None = None, driver: Any = None, timeout: float | None = None) -> dict[str, Any]:
+              q: Any = None, expected_graph_version: str | None = None, driver: Any = None, timeout: float | None = None, native: Any = None) -> dict[str, Any]:
     """q / driver:服务共用的 Qdrant 客户端与 Neo4j driver;不传 driver 就现建、用完关掉。
     history / as_of:时间口径(见 time_scope);各类关系的条数、总数、实体名下的事实数都按同一口径数,
     time.hidden 是同样条件下被口径筛掉的关系条数。
@@ -474,22 +489,22 @@ def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entit
     from . import docstatus
     if scope["mode"] == "current" and docstatus.graph_refresh_pending(settings, source):
         raise ValueError("graph_refresh_pending: source validity changed; current graph answers are temporarily unavailable")
-    own_driver = driver is None
+    own_driver = driver is None and native is None
     if own_driver:
         driver = neo4j_driver(settings)
     try:
-        gv = active_neo4j_graph_version(driver, source.kb_id)
+        gv = native.version if native is not None else active_neo4j_graph_version(driver, source.kb_id)
         if expected_graph_version is not None and gv != expected_graph_version:
             from .library import StaleReference
             raise StaleReference("graph_version_changed: repeat the original lookup for a current graph reference")
         if not gv:
             raise KeyError(f"{source.kb_id} has no active graph")
-        with driver.session() as session:
-            if timeout:
+        with (nullcontext(native) if native is not None else driver.session()) as session:
+            if timeout and native is None:
                 session = TimedSession(session, timeout)
             matches = resolve_entity(session, source.kb_id, gv, entity_id=entity_id, name=entity)
             if not matches:
-                cands = dense_candidates(settings, source, entity or "", q=q) if entity else []
+                cands = native.dense_candidates(entity) if native is not None else dense_candidates(settings, source, entity or "", q=q) if entity else []
                 return {"kb_id": source.kb_id, "graph_version": gv, "found": False, "entity": None, "matches": [], "candidates": cands,
                         "neighbors": [], "note": "no entity with that title or alias; pick one of the candidates by id"}
             if len(matches) > 1:
@@ -509,7 +524,7 @@ def neighbors(settings: Settings, source: KBSource, *, entity: str | None, entit
     finally:
         if own_driver:
             driver.close()
-    backfill_evidence(q, source.collection, rows, anchors=[center.get("title"), *(center.get("aliases") or [])])
+    backfill_evidence(q, source.collection, rows, store=native.store.chunks if native is not None else None, anchors=[center.get("title"), *(center.get("aliases") or [])])
     for r in rows:
         r.pop("_names", None)
     # Number of relations under the same filter (not bounded by limit): tells the caller whether what it got is everything
@@ -742,7 +757,7 @@ ENTITY_KINDS = ("instance", "class", "all")
 
 def list_entities(settings: Settings, source: KBSource, *, types: list[str] | None = None, uppers: list[str] | None = None,
                   kind: str = "all", name: str | None = None, limit: int = 50, offset: int = 0, driver: Any = None,
-                  timeout: float | None = None) -> dict[str, Any]:
+                  timeout: float | None = None, native: Any = None) -> dict[str, Any]:
     """按类型 / 上层类 / 类与实例 / 名字列出现行图版本里的实体,带总数与翻页,按 pagerank 降序(「全部 / 所有」类问题用)。
     第一页(offset=0)另带各类型的实体数(含其中几个是类别名),调用方据此看这个库有哪些类型、各有多少。
     每个实体带提到它最多的几份文档(docs)和文档总数(doc_count),清单里的条目可以直接引用。
@@ -763,37 +778,40 @@ def list_entities(settings: Settings, source: KBSource, *, types: list[str] | No
              " AND ($kind = 'all' OR coalesce(e.kind, 'instance') = $kind)"
              " AND ($name = '' OR toLower(e.title) CONTAINS $name OR any(a IN coalesce(e.aliases, []) WHERE toLower(a) CONTAINS $name)"
              " OR any(x IN coalesce(e.external_ids, []) WHERE toLower(x) CONTAINS $name))")
-    own_driver = driver is None
+    own_driver = driver is None and native is None
     if own_driver:
         driver = neo4j_driver(settings)
     try:
-        gv = active_neo4j_graph_version(driver, source.kb_id)
+        gv = native.version if native is not None else active_neo4j_graph_version(driver, source.kb_id)
         if not gv:
             raise KeyError(f"{source.kb_id} has no active graph")
         params = {"kb": source.kb_id, "gv": gv, "types": filters["types"], "uppers": filters["uppers"], "kind": kind,
                   "name": filters["name"]}
-        with driver.session() as session:
-            if timeout:
+        with (nullcontext(native) if native is not None else driver.session()) as session:
+            if timeout and native is None:
                 session = TimedSession(session, timeout)
-            head = "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) WHERE "
-            total = int((session.run(head + where + " RETURN count(e) AS total", **params).data() or [{}])[0].get("total") or 0)
-            rows = session.run(
-                head + where + f" RETURN {ENTITY_RETURN} "
-                "ORDER BY coalesce(e.pagerank, 0) DESC, e.id SKIP $offset LIMIT $limit", offset=offset, limit=limit, **params).data()
-            type_rows = None
-            if offset == 0:
-                type_rows = session.run(
-                    head + LIVE_ENTITY + " RETURN e.type AS etype, coalesce(e.upper, 'entity') AS upper, count(e) AS n, "
-                    "sum(CASE WHEN e.kind = 'class' THEN 1 ELSE 0 END) AS classes ORDER BY n DESC, etype LIMIT 100",
-                    kb=source.kb_id, gv=gv).data()
-            # 每个实体出自哪些文档:清单里的条目要能直接引用,不必为了找出处再各查一次
-            doc_rows = session.run(
-                "UNWIND $ids AS eid "
-                "MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[:MENTIONED_IN]->(c:QdrantChunkSnapshot) "
-                "WHERE c.rel_path IS NOT NULL "
-                "WITH eid, c.rel_path AS rel_path, count(c) AS mentions ORDER BY mentions DESC, rel_path "
-                "RETURN eid, collect(rel_path)[..$top] AS docs, count(rel_path) AS doc_count",
-                ids=[str(r.get("id")) for r in rows], kb=source.kb_id, gv=gv, top=LIST_DOCS_PER_ENTITY).data() if rows else []
+            if native is not None:
+                total, rows, type_rows, doc_rows = native.list_entities(filters, offset, limit)
+            else:
+                head = "MATCH (e:Entity {kb_id: $kb, graph_version: $gv}) WHERE "
+                total = int((session.run(head + where + " RETURN count(e) AS total", **params).data() or [{}])[0].get("total") or 0)
+                rows = session.run(
+                    head + where + f" RETURN {ENTITY_RETURN} "
+                    "ORDER BY coalesce(e.pagerank, 0) DESC, e.id SKIP $offset LIMIT $limit", offset=offset, limit=limit, **params).data()
+                type_rows = None
+                if offset == 0:
+                    type_rows = session.run(
+                        head + LIVE_ENTITY + " RETURN e.type AS etype, coalesce(e.upper, 'entity') AS upper, count(e) AS n, "
+                        "sum(CASE WHEN e.kind = 'class' THEN 1 ELSE 0 END) AS classes ORDER BY n DESC, etype LIMIT 100",
+                        kb=source.kb_id, gv=gv).data()
+                # 每个实体出自哪些文档:清单里的条目要能直接引用,不必为了找出处再各查一次
+                doc_rows = session.run(
+                    "UNWIND $ids AS eid "
+                    "MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[:MENTIONED_IN]->(c:QdrantChunkSnapshot) "
+                    "WHERE c.rel_path IS NOT NULL "
+                    "WITH eid, c.rel_path AS rel_path, count(c) AS mentions ORDER BY mentions DESC, rel_path "
+                    "RETURN eid, collect(rel_path)[..$top] AS docs, count(rel_path) AS doc_count",
+                    ids=[str(r.get("id")) for r in rows], kb=source.kb_id, gv=gv, top=LIST_DOCS_PER_ENTITY).data() if rows else []
     finally:
         if own_driver:
             driver.close()
@@ -843,7 +861,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
                prop: str | None = None, match: str = "auto", doc_id: str | None = None, conflict_only: bool = False,
                history: bool = False, as_of: str | None = None,
                limit: int = 50, offset: int = 0, fields: tuple[str, ...] | None = None, q: Any = None, expected_graph_version: str | None = None, content_version: str | None = None, driver: Any = None,
-               timeout: float | None = None) -> dict[str, Any]:
+               timeout: float | None = None, native: Any = None) -> dict[str, Any]:
     """按主体 / 属性 / 文档列出现行图版本里的限定事实,带总数与翻页(「某主体的全部参数」「某属性在各主体上的值」
     「这份文档里登记了哪些事实」「哪些值在不同文档里对不上」用)。
     主体按 id 或名字(标题 / 别名)找,沿 HAS_SPEC 边取它名下的事实;同名多个时返回候选,由调用方选定 ID。
@@ -873,11 +891,11 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
         raise ValueError("graph_refresh_pending: source validity changed; current graph answers are temporarily unavailable")
     effect = in_effect("f", observed="observed", scope=tscope)
     base = {"kb_id": source.kb_id, "kb_name": kb_name(source)}
-    own_driver = driver is None
+    own_driver = driver is None and native is None
     if own_driver:
         driver = neo4j_driver(settings)
     try:
-        gv = active_neo4j_graph_version(driver, source.kb_id)
+        gv = native.version if native is not None else active_neo4j_graph_version(driver, source.kb_id)
         if expected_graph_version is not None and gv != expected_graph_version:
             from .library import StaleReference
             raise StaleReference("graph_version_changed: repeat the original lookup for a current graph reference")
@@ -889,15 +907,15 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
                 raise ValueError("content_version requires a document")
             require_document_version(settings, source, doc_id, content_version, graph_version=gv)
         base["graph_version"] = gv
-        with driver.session() as session:
-            if timeout:
+        with (nullcontext(native) if native is not None else driver.session()) as session:
+            if timeout and native is None:
                 session = TimedSession(session, timeout)
             center: dict[str, Any] | None = None
             matches: list[dict[str, Any]] = []
             if subject or subject_id:
                 matches = resolve_entity(session, source.kb_id, gv, entity_id=subject_id, name=subject)
                 if not matches:
-                    cands = dense_candidates(settings, source, subject or "", q=q) if subject else []
+                    cands = native.dense_candidates(subject) if native is not None else dense_candidates(settings, source, subject or "", q=q) if subject else []
                     return {**base, "found": False, "subject": None, "matches": [], "candidates": cands, "total": 0, "count": 0, "facts": [],
                             "note": "no entity with that title or alias; pick one of the candidates by id"}
                 if len(matches) > 1:
@@ -905,77 +923,85 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
                             "total": 0, "count": 0, "facts": [], "note": "multiple identities match; select a subject_id"}
                 matches.sort(key=lambda m: (-int(m.get("degree") or 0), -float(m.get("pagerank") or 0.0)))
                 center = matches[0]
-            scope = ("MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $sid})-[:HAS_SPEC]->(f:Spec)" if center is not None
-                     else "MATCH (f:Spec {kb_id: $kb, graph_version: $gv})")
-            params: dict[str, Any] = {"kb": source.kb_id, "gv": gv, "p": needle, "keys": [], "day": tscope["day"]}
-            if center is not None:
-                params["sid"] = str(center["id"])
-            # The document and conflict conditions go into the property probe, the count and the listing; the property
-            # summary is scoped by the document only (it answers "which properties does this scope have")
-            in_doc = "f.doc_id = $doc" if doc_id else ""
-            if doc_id:
-                params["doc"] = str(doc_id)
-            narrow = " AND ".join(c for c in (in_doc, "f.conflict_group IS NOT NULL" if conflict_only else "") if c)
-            also = f" AND {narrow}" if narrow else ""
-            where, matched, keys = "true", None, []
-            if needle:
-                for mode in (("exact", "contains") if match == "auto" else (match,)):
-                    found_keys = session.run(f"{scope} WHERE {FACT_MATCH[mode]}{also} RETURN DISTINCT f.concept_key AS key LIMIT $top",
-                                             top=CONCEPT_KEYS_MAX, **params).data()
-                    if found_keys:
-                        matched, keys = mode, [str(r["key"]) for r in found_keys if r.get("key")]
-                        break
-                params["keys"] = keys
-                # every spelling under the matched concept keys, plus the facts the text matches directly (facts of
-                # older graphs without concept keys can only be reached by the latter)
-                where = f"(f.concept_key IN $keys OR {FACT_MATCH[matched]})" if matched else "false"
-            where += also
-            every = None
-            if tscope["mode"] != "history":
-                every = int((session.run(f"{scope} WHERE {where} RETURN count(f) AS total", **params).data() or [{}])[0].get("total") or 0)
-            where += f" AND {effect}"
-            total = int((session.run(f"{scope} WHERE {where} RETURN count(f) AS total", **params).data() or [{}])[0].get("total") or 0)
-            order = "coalesce(f.concept, f.property, ''), coalesce(f.valid_from, ''), coalesce(f.series_index, 0), f.id"
-            if center is None:
-                order = "coalesce(f.subject, ''), " + order
-            if conflict_only:
-                order = "coalesce(f.conflict_group, ''), " + order          # the facts of one conflict group side by side
-            row_map = "f {" + ", ".join(f".{k}" for k in _FACT_BASIC) + "}"
-            if center is not None:
-                listing = f"{scope} WHERE {where} RETURN {row_map} AS row, e.id AS subject_id ORDER BY {order} SKIP $offset LIMIT $limit"
+            if native is not None:
+                picked, subject_ids, members, properties, matched, keys, every, total = native.select_facts(
+                    center, needle, match, doc_id, conflict_only, tscope, offset, limit)
             else:
-                # Sort and page first, then find the subjects: one lookup for each of this page's few dozen facts. A fact
-                # can hang under several subjects; the smallest id is taken so the result is stable. Aggregation drops
-                # the row order, so the rows are sorted again by the same order before returning
-                listing = (f"{scope} WHERE {where} WITH f ORDER BY {order} SKIP $offset LIMIT $limit "
-                           "OPTIONAL MATCH (s:Entity {kb_id: $kb, graph_version: $gv})-[:HAS_SPEC]->(f) "
-                           f"WITH f, min(s.id) AS subject_id RETURN {row_map} AS row, subject_id ORDER BY {order}")
-            records = session.run(listing, offset=offset, limit=limit, **params).data() if total else []
-            picked = [dict(r.get("row") or {}) for r in records]
-            subject_ids = [r.get("subject_id") for r in records]
-            members = series_members(session, source.kb_id, gv, (r.get("series_key") for r in picked), scope=tscope, doc_id=doc_id)
-            properties = None
-            if (center is not None or doc_id) and offset == 0:
-                properties = session.run(
-                    f"{scope} WHERE {in_doc or 'true'} AND {effect} "
-                    "RETURN coalesce(f.concept, f.property) AS concept, f.concept_key AS concept_key, count(f) AS n "
-                    "ORDER BY n DESC, concept LIMIT $top", top=PROPERTY_SUMMARY_LIMIT, **params).data()
+                scope = ("MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: $sid})-[:HAS_SPEC]->(f:Spec)" if center is not None
+                         else "MATCH (f:Spec {kb_id: $kb, graph_version: $gv})")
+                params: dict[str, Any] = {"kb": source.kb_id, "gv": gv, "p": needle, "keys": [], "day": tscope["day"]}
+                if center is not None:
+                    params["sid"] = str(center["id"])
+                # The document and conflict conditions go into the property probe, the count and the listing; the property
+                # summary is scoped by the document only (it answers "which properties does this scope have")
+                in_doc = "f.doc_id = $doc" if doc_id else ""
+                if doc_id:
+                    params["doc"] = str(doc_id)
+                narrow = " AND ".join(c for c in (in_doc, "f.conflict_group IS NOT NULL" if conflict_only else "") if c)
+                also = f" AND {narrow}" if narrow else ""
+                where, matched, keys = "true", None, []
+                if needle:
+                    for mode in (("exact", "contains") if match == "auto" else (match,)):
+                        found_keys = session.run(f"{scope} WHERE {FACT_MATCH[mode]}{also} RETURN DISTINCT f.concept_key AS key LIMIT $top",
+                                                 top=CONCEPT_KEYS_MAX, **params).data()
+                        if found_keys:
+                            matched, keys = mode, [str(r["key"]) for r in found_keys if r.get("key")]
+                            break
+                    params["keys"] = keys
+                    # every spelling under the matched concept keys, plus the facts the text matches directly (facts of
+                    # older graphs without concept keys can only be reached by the latter)
+                    where = f"(f.concept_key IN $keys OR {FACT_MATCH[matched]})" if matched else "false"
+                where += also
+                every = None
+                if tscope["mode"] != "history":
+                    every = int((session.run(f"{scope} WHERE {where} RETURN count(f) AS total", **params).data() or [{}])[0].get("total") or 0)
+                where += f" AND {effect}"
+                total = int((session.run(f"{scope} WHERE {where} RETURN count(f) AS total", **params).data() or [{}])[0].get("total") or 0)
+                order = "coalesce(f.concept, f.property, ''), coalesce(f.valid_from, ''), coalesce(f.series_index, 0), f.id"
+                if center is None:
+                    order = "coalesce(f.subject, ''), " + order
+                if conflict_only:
+                    order = "coalesce(f.conflict_group, ''), " + order          # the facts of one conflict group side by side
+                row_map = "f {" + ", ".join(f".{k}" for k in _FACT_BASIC) + "}"
+                if center is not None:
+                    listing = f"{scope} WHERE {where} RETURN {row_map} AS row, e.id AS subject_id ORDER BY {order} SKIP $offset LIMIT $limit"
+                else:
+                    # Sort and page first, then find the subjects: one lookup for each of this page's few dozen facts. A fact
+                    # can hang under several subjects; the smallest id is taken so the result is stable. Aggregation drops
+                    # the row order, so the rows are sorted again by the same order before returning
+                    listing = (f"{scope} WHERE {where} WITH f ORDER BY {order} SKIP $offset LIMIT $limit "
+                               "OPTIONAL MATCH (s:Entity {kb_id: $kb, graph_version: $gv})-[:HAS_SPEC]->(f) "
+                               f"WITH f, min(s.id) AS subject_id RETURN {row_map} AS row, subject_id ORDER BY {order}")
+                records = session.run(listing, offset=offset, limit=limit, **params).data() if total else []
+                picked = [dict(r.get("row") or {}) for r in records]
+                subject_ids = [r.get("subject_id") for r in records]
+                members = series_members(session, source.kb_id, gv, (r.get("series_key") for r in picked), scope=tscope, doc_id=doc_id)
+                properties = None
+                if (center is not None or doc_id) and offset == 0:
+                    properties = session.run(
+                        f"{scope} WHERE {in_doc or 'true'} AND {effect} "
+                        "RETURN coalesce(f.concept, f.property) AS concept, f.concept_key AS concept_key, count(f) AS n "
+                        "ORDER BY n DESC, concept LIMIT $top", top=PROPERTY_SUMMARY_LIMIT, **params).data()
     finally:
         if own_driver:
             driver.close()
     degraded: list[str] = []
     payloads: dict[str, dict[str, Any]] = {}
     fact_ids = [str(r["id"]) for r in picked]
-    if q is not None and fact_ids:
+    if (q is not None or native is not None) and fact_ids:
         by_point = {point_id_for(gv, fid): fid for fid in fact_ids}
         try:
             ids = list(by_point)
-            for start in range(0, len(ids), 256):
-                for rec in q.retrieve(collection_name=graph_collection_alias(source.collection, "spec"), ids=ids[start:start + 256],
-                                      with_payload=True, with_vectors=False):
-                    pl = dict(rec.payload or {})
-                    if str(pl.get("graph_version") or gv) == gv and str(rec.id) in by_point:
-                        payloads[by_point[str(rec.id)]] = pl
+            if native is not None:
+                payloads = {by_point[pid]: pl for pid, (pl, _) in native.store.graph.vectors.lookup(
+                    native.collection("spec"), ids).items() if pid in by_point}
+            else:
+                for start in range(0, len(ids), 256):
+                    for rec in q.retrieve(collection_name=graph_collection_alias(source.collection, "spec"), ids=ids[start:start + 256],
+                                          with_payload=True, with_vectors=False):
+                        pl = dict(rec.payload or {})
+                        if str(pl.get("graph_version") or gv) == gv and str(rec.id) in by_point:
+                            payloads[by_point[str(rec.id)]] = pl
         except Exception as exc:
             degraded.append(f"spec_payload: {type(exc).__name__}")
     raw = [spec_result_row(payloads[fid]) if fid in payloads else {**{k: r.get(k) for k in _FACT_BASIC}, "point_ids": []}
@@ -1006,9 +1032,9 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
         degraded.append(f"spec_payload_missing: {missing}")
     cited = {fid: [str(p) for p in (row.get("point_ids") or [])[:EVIDENCE_PER_FACT]] for fid, row in zip(fact_ids, raw)}
     meta: dict[str, dict[str, Any]] | None = None
-    if q is not None and any(cited.values()):
+    if (q is not None or native is not None) and any(cited.values()):
         try:
-            meta = point_payloads(q, source.collection, [p for pids in cited.values() for p in pids])
+            meta = point_payloads(q, source.collection, [p for pids in cited.values() for p in pids], store=native.store.chunks if native is not None else None)
         except Exception as exc:
             degraded.append(f"point_meta: {type(exc).__name__}")
     # conclusions only from source points that were checked: when the main collection gave nothing back the state
@@ -1037,7 +1063,7 @@ def list_facts(settings: Settings, source: KBSource, *, subject: str | None = No
 
 def list_pages(settings: Settings, source: KBSource, *, kind: str | None = None, title: str | None = None, page_id: str | None = None,
                entity_id: str | None = None, doc_id: str | None = None, with_text: bool = True, limit: int = 20, offset: int = 0,
-               paths: dict[str, str] | None = None, q: Any = None, history: bool = False, as_of: str | None = None) -> dict[str, Any]:
+               paths: dict[str, str] | None = None, q: Any = None, history: bool = False, as_of: str | None = None, native: Any = None) -> dict[str, Any]:
     """编译页(主体页 / 时间线页 / 来源页 / 索引页)的清单与全文:调用方要整页读,不必靠检索碰运气命中。
     页面集合很小(每库几百个点),整个集合 scroll 一遍、在进程里筛选排序翻页,比给每种筛选建 payload 索引简单;
     走别名,读到的就是现行版本。集合不存在(这个库没有图谱或没生成页面)→ KeyError。
@@ -1049,21 +1075,25 @@ def list_pages(settings: Settings, source: KBSource, *, kind: str | None = None,
 
     limit = max(1, min(100, int(limit)))
     offset = max(0, int(offset))
-    if q is None:
-        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-    alias = graph_collection_alias(source.collection, "page")
-    pages: list[dict[str, Any]] = []
-    cursor = None
-    try:
-        while True:
-            points, cursor = q.scroll(collection_name=alias, limit=PAGE_SCROLL, offset=cursor, with_payload=True, with_vectors=False)
-            pages.extend(dict(p.payload or {}) for p in points)
-            if cursor is None or not points:
-                break
-    except Exception as exc:
-        if getattr(exc, "status_code", None) == 404:          # no such collection: no graph, or this graph version generated no pages
-            raise KeyError(f"{source.kb_id} has no compiled pages") from exc
-        raise
+    if native is not None:
+        pages = native.payloads("page")
+        paths = paths or {r["doc_id"]: r.get("rel_path") for r in native.nodes("Document")}
+    else:
+        if q is None:
+            q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        alias = graph_collection_alias(source.collection, "page")
+        pages: list[dict[str, Any]] = []
+        cursor = None
+        try:
+            while True:
+                points, cursor = q.scroll(collection_name=alias, limit=PAGE_SCROLL, offset=cursor, with_payload=True, with_vectors=False)
+                pages.extend(dict(p.payload or {}) for p in points)
+                if cursor is None or not points:
+                    break
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:          # no such collection: no graph, or this graph version generated no pages
+                raise KeyError(f"{source.kb_id} has no compiled pages") from exc
+            raise
     from . import docstatus
     scope = time_scope(history=history, as_of=as_of)
     pending = scope["mode"] == "current" and docstatus.graph_refresh_pending(settings, source)
@@ -1102,7 +1132,7 @@ def list_pages(settings: Settings, source: KBSource, *, kind: str | None = None,
         row.update({"text_chars": len(text), "series": list(p.get("series") or []), "docs": [paths.get(d) for d in docs], "doc_ids": docs,
                     "entity_ids": eids, "concept_keys": list(p.get("concept_keys") or []), "path": p.get("path")})
         out_pages.append(row)
-    gv = next((str(p["graph_version"]) for p in pages if p.get("graph_version")), None)
+    gv = native.version if native is not None else next((str(p["graph_version"]) for p in pages if p.get("graph_version")), None)
     return {"kb_id": source.kb_id, "kb_name": kb_name(source), "graph_version": gv, "total": len(rows), "offset": offset, "limit": limit,
             "count": len(out_pages), "has_more": offset + len(out_pages) < len(rows), "kinds": kinds, "pages": out_pages,
             "time": scope, "degraded": ["graph_refresh_pending"] if pending else []}

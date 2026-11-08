@@ -25,8 +25,9 @@ def setup(tmp_path):
     (mirror / 'documents').mkdir(parents=True)
     with db.connect(state) as con:
         source, _ = discovery.enroll(con, mirror, 'documents')
-        db.upsert_llm(con, name='vision-a', base_url='http://vision-a.invalid/v1', api_key='key-a', model_id='image-a')
-        db.upsert_llm(con, name='vision-b', base_url='http://vision-b.invalid/v1', api_key='key-b', model_id='image-b')
+        db.upsert_llm(con, name='vision-a', base_url='http://vision-a.invalid/v1', api_key='key-a', model_id='image-a', multimodal=True, concurrency=3)
+        db.upsert_llm(con, name='vision-b', base_url='http://vision-b.invalid/v1', api_key='key-b', model_id='image-b', multimodal=True, concurrency=5)
+        db.upsert_llm(con, name='text-only', base_url='http://text.invalid/v1', api_key='', model_id='text')
         db.upsert_llm(con, name='messages-model', base_url='http://messages.invalid', api_key='', model_id='message', protocol='anthropic')
     cfg = SimpleNamespace(state_db=state, mirror_root=mirror, sources={source.kb_id: source},
         cache_dir=tmp_path / 'cache', embedding_base_url='http://embedding.invalid/v1',
@@ -81,7 +82,7 @@ def test_selection_is_passive_and_fresh_for_each_job(setup):
         with db.connect(cfg.state_db) as con:
             assert con.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0
             assert con.execute('SELECT count(*) FROM graph_builds').fetchone()[0] == 0
-        for bad in [None, '', '   ', ' vision-a ', 'missing', 'messages-model']:
+        for bad in [None, '', '   ', ' vision-a ', 'missing', 'messages-model', 'text-only']:
             with pytest.raises(ValueError):
                 service.update_kb_config(source.kb_id, {'vlm_model': bad})
         assert service.get_kb_config(source.kb_id)['config']['vlm_model'] == 'vision-b'
@@ -137,7 +138,7 @@ def test_enrollment_rejects_unselected_model_before_creating_library(setup):
     (cfg.mirror_root / 'new-documents').mkdir()
     limits = {'max_tokens_cap': 3276, 'max_tokens_min': 128}
     with patch.object(service, 'settings', return_value=cfg), patch.object(service, 'chunk_limits', return_value=limits), \
-         patch.object(service, 'qdrant_client') as vector:
+         patch("kb_pipeline.storage.standard.vector_client") as vector:
         with pytest.raises(ValueError, match='Select a multimodal model'):
             service.enroll('new-documents', {'max_tokens': 400, 'overlap_tokens': 80, 'vlm_model': None})
         vector.assert_not_called()
@@ -175,7 +176,7 @@ def test_referenced_model_cannot_change_to_incompatible_protocol(setup):
         with pytest.raises(ValueError, match='OpenAI'):
             service.save_llm({'name': 'vision-a', 'base_url': 'http://vision-a.invalid/v1',
                               'model_id': 'image-a', 'protocol': 'anthropic', 'clear_api_key': True})
-    assert parse_job._vlm_endpoint(cfg, replace(source, vlm_model='vision-a')) == ('http://vision-a.invalid/v1', 'key-a', 'image-a')
+    assert parse_job._vlm_endpoint(cfg, replace(source, vlm_model='vision-a')) == ('http://vision-a.invalid/v1', 'key-a', 'image-a', 3)
 
 
 @pytest.mark.parametrize('suffix,parser', [('.pdf','parse_pdf_enhanced'), ('.docx','parse_docx_enhanced'),
@@ -189,6 +190,7 @@ def test_each_visual_route_uses_selected_model(setup, tmp_path, suffix, parser):
     args = route.call_args.kwargs
     assert (args['vlm_base_url'], args['vlm_api_key'], args['vlm_model_id']) == ('http://vision-b.invalid/v1','key-b','image-b')
     assert cfg.vlm_model_id == 'default-image'
+    assert args['vlm_concurrency'] == 5
 
 
 def test_notebook_route_uses_selected_model(setup, tmp_path):
@@ -200,6 +202,7 @@ def test_notebook_route_uses_selected_model(setup, tmp_path):
         parse_job._parse_blocks(cfg, replace(source, vlm_model='vision-b'), path, tmp_path/'parse', 'profile', {})
     args = route.call_args.kwargs
     assert (args['base_url'], args['api_key'], args['model_id']) == ('http://vision-b.invalid/v1','key-b','image-b')
+    assert args['concurrency'] == 5
 
 
 def test_invalid_vision_model_does_not_break_text_route(setup, tmp_path):
@@ -220,7 +223,7 @@ def test_image_http_request_and_model_endpoint_cache_isolation(setup, tmp_path, 
     source = replace(source, vlm_model='vision-a')
     def register(endpoint, model='shared-model', key='first-key'):
         with db.connect(cfg.state_db) as con:
-            db.upsert_llm(con, name='vision-a', base_url=endpoint, api_key=key, model_id=model)
+            db.upsert_llm(con, name='vision-a', base_url=endpoint, api_key=key, model_id=model, multimodal=True, concurrency=3)
     def parse():
         return parse_job._parse_blocks(cfg, source, image, tmp_path/'parse', 'profile', {})
     register(url)
@@ -248,8 +251,8 @@ def test_table_review_uses_same_model_and_endpoint_cache_identity(setup, tmp_pat
     image = tmp_path/'table.png'
     Image.new('RGB', (320,240), 'white').save(image)
     with db.connect(cfg.state_db) as con:
-        db.upsert_llm(con, name='vision-a', base_url=url, api_key='review-key', model_id='review-model')
-    endpoint, key, model = parse_job._vlm_endpoint(cfg, replace(source, vlm_model='vision-a'))
+        db.upsert_llm(con, name='vision-a', base_url=url, api_key='review-key', model_id='review-model', multimodal=True)
+    endpoint, key, model, concurrency = parse_job._vlm_endpoint(cfg, replace(source, vlm_model='vision-a'))
     args = dict(image_path=image, base_url=endpoint, api_key=key, model_id=model, row_keys=['Alpha'], cache_json=tmp_path/'rows.json')
     rows = table_repair.transcribe_rows(**args)
     assert rows[0]['cells'] == [['Alpha'], ['12'], ['34']]
@@ -315,7 +318,7 @@ def test_switch_between_documents_keeps_prior_result_and_uses_new_choice(setup, 
     Image.new('RGB', (320, 240), 'blue').save(image)
     with db.connect(cfg.state_db) as con:
         for name in ['vision-a', 'vision-b']:
-            db.upsert_llm(con, name=name, base_url=url, api_key='synthetic-key', model_id=name)
+            db.upsert_llm(con, name=name, base_url=url, api_key='synthetic-key', model_id=name, multimodal=True)
         discovery.set_config(con, source.kb_id, {'vlm_model':'vision-a'})
     in_flight = parse_job._source_for_file(cfg, source.kb_id)
     with db.connect(cfg.state_db) as con:
@@ -326,3 +329,18 @@ def test_switch_between_documents_keeps_prior_result_and_uses_new_choice(setup, 
     assert [call[2]['model'] for call in calls] == ['vision-a','vision-b']
     assert first[0].metadata['vlm_model'] == 'vision-a'
     assert second[0].metadata['vlm_model'] == 'vision-b'
+
+
+def test_spreadsheet_image_route_uses_selected_model_limit(setup, tmp_path):
+    source, cfg = setup
+    path = tmp_path / 'sample.xlsx'
+    path.write_bytes(b'synthetic')
+    image = ParsedBlock(block_id='figure', block_type='image', text='Synthetic illustration',
+                        visual_ref=str(tmp_path / 'figure.png'), sheet_name='Sheet',
+                        parser='synthetic', parser_profile='test', doc_type='xlsx')
+    with patch.object(parse_job, 'parse_native_table', return_value=[]), \
+         patch('kb_pipeline.parsers.xlsx_images.extract_xlsx_images', return_value=[image]), \
+         patch('kb_pipeline.parsers.visual_blocks.enrich_blocks_with_vlm') as route:
+        parse_job._parse_blocks(cfg, replace(source, vlm_model='vision-b'), path, tmp_path/'parse', 'profile', {})
+    assert route.call_args.kwargs['concurrency'] == 5
+    assert route.call_args.kwargs['model_id'] == 'image-b'

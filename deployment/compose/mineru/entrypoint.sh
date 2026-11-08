@@ -60,11 +60,7 @@ python3 /usr/local/bin/carrel-mineru-detect.py --json \
   > "$SHARED_DIR/carrel-mineru.json.tmp"
 mv -f "$SHARED_DIR/carrel-mineru.json.tmp" "$SHARED_DIR/carrel-mineru.json"
 
-# With the local-models profile the parser shares the GPU with the four model
-# servers, and deploy.sh points MINERU_WAIT_FOR_URL at the last of them: this
-# model is loaded only after theirs (servers that profile the memory at the
-# same time fail and restart; see docker-compose.yml). The download and the
-# published decision above do not touch the GPU, so they are not delayed.
+# Optional operator-supplied startup dependency. Empty by default in both editions.
 if [[ -n "${MINERU_WAIT_FOR_URL:-}" ]]; then
   echo "[carrel-mineru] waiting for $MINERU_WAIT_FOR_URL before loading the model"
   until python3 -c 'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=5).read()' "$MINERU_WAIT_FOR_URL" >/dev/null 2>&1; do

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
-from openai import OpenAI
+from openai import OpenAI, omit
 
 
 _CLIENT_LOCK = threading.Lock()
@@ -18,7 +19,7 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
     with _CLIENT_LOCK:
         client = _CLIENTS.get(key)
         if client is None:
-            client = OpenAI(api_key=api_key, base_url=base_url, timeout=120, max_retries=0)
+            client = OpenAI(api_key=api_key or "not-required", base_url=base_url, timeout=120, max_retries=0)
             _CLIENTS[key] = client
     return client
 
@@ -64,13 +65,18 @@ class EmbeddingClient:
         model_id: str,
         dim: int,
         batch_size: int,
+        concurrency: int = 1,
         retry: int = 5,
         sleep_seconds: float = 0.1,
     ) -> None:
         self.client = _client_for(base_url, api_key)
+        # The SDK requires credentials even when the configured endpoint has no auth.
+        # Omit the header at request level, without inheriting ambient API keys.
+        self.request_options = {} if api_key else {"extra_headers": {"Authorization": omit}}
         self.model_id = model_id
         self.dim = dim
         self.batch_size = max(1, batch_size)
+        self.concurrency = max(1, int(concurrency))
         self.retry = max(1, retry)
         self.sleep_seconds = max(0.0, sleep_seconds)
 
@@ -79,13 +85,16 @@ class EmbeddingClient:
         total_batches = (len(texts) + self.batch_size - 1) // self.batch_size
         if progress_cb is not None:
             progress_cb(0, total_batches)
-        for i in range(0, len(texts), self.batch_size):
+        if not texts:
+            return vectors
+
+        def one(i):
             batch = texts[i:i + self.batch_size]
             end_idx = i + len(batch)
             last_error: Exception | None = None
             for attempt in range(1, self.retry + 1):
                 try:
-                    resp = self.client.embeddings.create(model=self.model_id, input=batch, dimensions=self.dim)
+                    resp = self.client.embeddings.create(model=self.model_id, input=batch, dimensions=self.dim, **self.request_options)
                     batch_vectors = [item.embedding for item in resp.data]
                     if len(batch_vectors) != len(batch):
                         raise RuntimeError(
@@ -98,7 +107,6 @@ class EmbeddingClient:
                         raise EmbeddingDimensionError(
                             f"embedding dim mismatch: expected {self.dim}, got {bad}"
                         )
-                    vectors.extend(batch_vectors)
                     last_error = None
                     break
                 except EmbeddingDimensionError:
@@ -121,10 +129,27 @@ class EmbeddingClient:
                         time.sleep(min(60.0, 2.0 * attempt))
             if last_error is not None:
                 raise last_error
-            if progress_cb is not None:
-                progress_cb(i // self.batch_size + 1, total_batches)
             if self.sleep_seconds > 0:
                 time.sleep(self.sleep_seconds)
+            return batch_vectors
+
+        def collect(results):
+            for done, batch_vectors in enumerate(results, 1):
+                vectors.extend(batch_vectors)
+                if progress_cb is not None:
+                    progress_cb(done, total_batches)
+
+        starts = range(0, len(texts), self.batch_size)
+        if self.concurrency == 1:
+            collect(map(one, starts))
+        else:
+            with ThreadPoolExecutor(max_workers=min(self.concurrency, total_batches)) as executor:
+                try:
+                    # map preserves input order even when later requests finish first.
+                    collect(executor.map(one, starts))
+                except Exception:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    raise
         return vectors
 
     def _rejected_input(self, batch: list[str], exc: Exception) -> int | None:
@@ -142,7 +167,7 @@ class EmbeddingClient:
 
     def _accepts(self, text: str) -> bool:
         try:
-            self.client.embeddings.create(model=self.model_id, input=[text], dimensions=self.dim)
+            self.client.embeddings.create(model=self.model_id, input=[text], dimensions=self.dim, **self.request_options)
         except Exception as exc:
             if _status_of(exc) in (400, 422):
                 return False

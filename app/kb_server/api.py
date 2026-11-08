@@ -35,6 +35,31 @@ def health() -> dict[str, Any]:
     return service.health()
 
 
+@router.get("/model-endpoints")
+def model_endpoints() -> dict[str, Any]:
+    from .model_endpoints import get_endpoints
+    return _wrap(get_endpoints)
+
+
+@router.post("/model-endpoints/{role}/key")
+def reveal_model_endpoint_key(role: str, payload: dict[str, Any], response: Response) -> dict[str, str]:
+    from .model_endpoints import reveal_endpoint_key
+    response.headers["Cache-Control"] = "no-store"
+    return _wrap(reveal_endpoint_key, role, payload)
+
+
+@router.put("/model-endpoints/{role}")
+def save_model_endpoint(role: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from .model_endpoints import save_endpoint
+    return _wrap(save_endpoint, role, payload)
+
+
+@router.post("/model-endpoints/{role}/probe")
+def probe_model_endpoint(role: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from .model_endpoints import probe_endpoint
+    return _wrap(probe_endpoint, role, payload)
+
+
 _limits_cache: dict[str, Any] = {"at": 0.0, "value": None}
 
 
@@ -78,8 +103,8 @@ def delete_kb(kb_id: str) -> dict[str, Any]:
 
 
 @router.post("/kbs/{kb_id}/graph_build")
-def graph_build(kb_id: str) -> dict[str, Any]:
-    return _wrap(service.trigger_graph_build, kb_id)
+def graph_build(kb_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    return _wrap(service.trigger_graph_build, kb_id, mode=(payload or {}).get("mode", "build"))
 
 
 @router.post("/kbs/{kb_id}/parse_pause")
@@ -303,6 +328,12 @@ def list_llms() -> list[dict[str, Any]]:
 @router.post("/llms")
 def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
     return _wrap(service.save_llm, payload)
+
+
+@router.post("/llms/{name}/key")
+def reveal_llm_key(name: str, response: Response) -> dict[str, str]:
+    response.headers["Cache-Control"] = "no-store"
+    return _wrap(service.reveal_llm_key, name)
 
 
 @router.delete("/llms/{name}")

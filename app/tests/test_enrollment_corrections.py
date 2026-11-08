@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 
 from kb_pipeline import db, discovery
 from kb_pipeline.graph import corrections
+from kb_pipeline.storage import standard
+from kb_pipeline import search_fts
 from kb_server import service
 from kb_server.main import create_app
 
@@ -35,7 +37,7 @@ def env(tmp_path, monkeypatch):
         (cfg.mirror_root / name).mkdir(parents=True)
     db.init_db(cfg.state_db)
     with db.connect(cfg.state_db) as con:
-        db.upsert_llm(con, name="vision", base_url="http://vision.invalid/v1", api_key="", model_id="synthetic-vision")
+        db.upsert_llm(con, name="vision", base_url="http://vision.invalid/v1", api_key="", model_id="synthetic-vision", multimodal=True)
     cfg.corrections_dir.mkdir()
     path = cfg.corrections_dir / "kb_001.yaml"
     path.write_text(OLD_RULES, encoding="utf-8")
@@ -45,8 +47,8 @@ def env(tmp_path, monkeypatch):
         "effective_max_model_len": 4096, "embedding_max_model_len": 4096,
     })
     effects = {}
-    for owner, name in ((service, "qdrant_client"), (service, "ensure_collection"),
-                        (service.search_fts, "ensure_indices"), (service, "kick_scan"),
+    for owner, name in ((standard, "vector_client"), (standard.qdrant, "ensure_collection"),
+                        (search_fts, "ensure_indices"), (service, "kick_scan"),
                         (service, "kick_worker")):
         effects[name] = Mock(return_value=True)
         monkeypatch.setattr(owner, name, effects[name])

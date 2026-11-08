@@ -144,7 +144,7 @@ def document_dates(settings: Settings, rows: Iterable[dict[str, Any]], graph_ver
 
 
 def annotate_dates(settings: Settings, rows: list[dict[str, Any]], scope: dict[str, Any], *,
-               driver: Any = None, timeout: float | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+               driver: Any = None, timeout: float | None = None, provider: Any = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Keep retrospective sources; document dates are not fact occurrence dates.
 
     Only structured assertions can apply the fact-time cutoff. Unknown document
@@ -154,7 +154,7 @@ def annotate_dates(settings: Settings, rows: list[dict[str, Any]], scope: dict[s
     if not scope.get("as_of") or not rows:
         return rows, stats
     try:
-        dates = document_dates(settings, rows, scope.get("graph_versions") or {}, driver=driver, timeout=timeout)
+        dates = (provider(rows, scope.get("graph_versions") or {}, timeout=timeout) if provider is not None else document_dates(settings, rows, scope.get("graph_versions") or {}, driver=driver, timeout=timeout))
     except Exception as exc:
         dates = document_dates(settings, rows, {})
         stats["degraded"] = f"document_dates: {type(exc).__name__}"

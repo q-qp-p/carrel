@@ -6,6 +6,9 @@ Carrel separates ingestion, graph construction, and retrieval. A shared
 SQLite state database tracks files, configurations, jobs, and build progress.
 The console operates these processes; agents consume the retrieval API.
 
+The main pipelines access Standard or Light through shared chunk, keyword and graph
+adapters. See [storage interfaces](storage.md) for queries, publication and maintenance.
+
 ## Ingestion
 
 1. **Scan enabled folders.** Compare files against recorded metadata and

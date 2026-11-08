@@ -52,6 +52,7 @@ header{position:sticky;top:0;z-index:30;display:flex;align-items:center;gap:14px
 .lang-switch button.on{background:var(--card);color:var(--text);box-shadow:var(--shadow-card)}
 .tabs{margin-left:auto;display:flex;gap:8px;flex:none}
 .tabs button{background:var(--card);border-color:var(--line-strong);color:var(--text-2);display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap}
+.tabs button[hidden]{display:none}
 #btn-llms{min-width:80px}#btn-health{min-width:96px}   /* text widths differ between the two languages; a minimum keeps the two top-right buttons in place across languages */
 .tabs button:hover{background:var(--well);border-color:#c9c9d4}
 .tabs button.active{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
@@ -475,6 +476,11 @@ td.path{word-break:break-all;min-width:220px}
 .llm-chip.key{font-family:inherit;color:var(--green);background:#effaf5;border-color:#d3f0e2}
 .llm-card .fld{margin-bottom:12px}
 .llm-card .fld:first-child{margin-top:2px}
+.llm-form-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:end;margin-bottom:12px}
+.llm-card .llm-form-row .fld{min-width:0;margin:0}
+.llm-form-limits{grid-template-columns:repeat(2,minmax(0,1fr)) minmax(90px,.6fr)}
+.llm-form-multimodal label.f{display:flex;align-items:center;gap:6px;min-height:34px;margin:0;white-space:nowrap}
+.llm-form-multimodal input{margin:0;flex:none}
 .llm-card .c-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:2px}
 .llm-empty{font-size:12.5px;color:var(--muted);padding:6px 4px 12px;line-height:1.6}
 #llm-add{width:100%;padding:9px;border:1px dashed var(--line-strong);font-size:13px;color:var(--muted);
@@ -563,8 +569,8 @@ html[lang=en] body.parse-disabled header::before{content:"Parsing is disabled in
   <div class="brand"><h1><span>Carrel 控制台</span><span class="ghost" aria-hidden="true">Carrel Console</span></h1>
     <div class="lang-switch" id="lang-switch" title="界面语言 / Language"><button type="button" data-lang="zh">中</button><button type="button" data-lang="en">EN</button></div></div>
   <nav class="tabs">
-    <button id="btn-llms">模型列表</button>
-    <button id="btn-health"><span class="dot gray" id="health-dot"></span>服务状态</button>
+    <button id="btn-llms">系统设置</button>
+    <button id="btn-health" hidden><span class="dot gray" id="health-dot"></span>服务状态</button>
   </nav>
 </header>
 
@@ -684,12 +690,11 @@ This is an image from a knowledge-base document; examine it carefully and output
 Common kinds: UI screenshots, architecture diagrams, flow charts, topologies, data charts, tables, photos, formulas, whole slides; decide the kind first, then extract the information item by item.
 Transcribe text, values, units and identifiers exactly as written; ignore headers, footers, page numbers, watermarks and purely decorative elements, and extract only content that carries information.
 (独立图片文件会额外附上文件名作为主题参考)"></textarea>
-              <div class="hint">保存只更新策略,解析由自动扫描或「立即/继续解析」触发;要应用到已入库内容用「整库重新解析」。</div></div>
+              <div class="hint">保存后按自动策略解析,也可手动开始或继续;已入库内容用「整库重新解析」。</div></div>
           </fieldset>
           <div class="cfg-actions">
             <button class="primary" id="cfg-save" disabled>保存配置</button>
-            <button id="cfg-parse-now" disabled>立即/继续解析</button>
-            <button id="cfg-parse-pause" disabled>暂停解析</button>
+            <button id="cfg-parse-now" disabled>立即解析</button>
             <button id="cfg-reparse" disabled>整库重新解析</button>
             <span class="note" id="cfg-note"></span>
             <button class="danger" id="cfg-delete" disabled>删除知识库</button>
@@ -805,9 +810,8 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
           </fieldset>
           <div class="cfg-actions">
             <button class="primary" id="cfg-gsave" disabled>保存配置</button>
-            <button id="cfg-gbuild" disabled>立即/重新建图</button>
-            <button id="cfg-gappend" disabled title="只抽新增 / 变更文档的单元,回放上一版的归并结论、沿用没变的向量,作为新版本切换">并入新增内容</button>
-            <button id="cfg-gpause" disabled>暂停建图</button>
+            <button id="cfg-gbuild" disabled>立即建图</button>
+            <button id="cfg-grebuild" disabled>整库重新建图</button>
             <span class="note" id="cfg-gnote"></span>
             <button class="danger" id="cfg-gdelete" disabled>删除知识图谱</button>
           </div>
@@ -819,11 +823,22 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
 
 <div class="scrim" id="scrim"></div>
 <div id="llm-win" class="drawer">
-  <div class="pw-head"><span>模型列表</span>
+  <div class="pw-head"><span>系统设置</span>
     <button class="panel-close" aria-label="收起" title="收起">✕</button></div>
   <div class="pw-body">
-    <div id="llm-cards"></div>
-    <button id="llm-add" title="添加模型">＋ 添加模型</button>
+    <section id="settings-llm-section" class="settings-section" aria-labelledby="settings-models-title">
+      <div class="settings-section-head"><h2 id="settings-models-title">LLM</h2>
+        <button id="llm-add" title="添加模型">＋ 添加模型</button></div>
+      <div id="llm-cards"></div>
+    </section>
+    <section id="settings-embedding-section" class="settings-section" aria-labelledby="settings-embedding-title">
+      <div class="settings-section-head"><h2 id="settings-embedding-title">Embedding</h2></div>
+      <div id="embedding-cards"></div>
+    </section>
+    <section id="settings-reranker-section" class="settings-section" aria-labelledby="settings-reranker-title">
+      <div class="settings-section-head"><h2 id="settings-reranker-title">Reranker</h2></div>
+      <div id="reranker-cards"></div>
+    </section>
   </div>
 </div>
 <div id="health-win" class="drawer">
@@ -849,6 +864,8 @@ Transcribe text, values, units and identifiers exactly as written; ignore header
 <script src="vendor/markdown-it.umd.min.js?v=20261001-1"></script>
 <script src="vendor/katex.min.js?v=20261001-1"></script>
 <script src="i18n.js?v=20261102-7"></script>
+<script src="key-visibility.js"></script>
 <script src="app.js?v=20261102-12"></script>
+<script src="model-settings.js"></script>
 </body>
 </html>

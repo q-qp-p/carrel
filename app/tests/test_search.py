@@ -2,6 +2,9 @@
 auth, all with stubs, never connecting to any external service."""
 from __future__ import annotations
 
+from storage_fakes import storage_runtime
+from kb_pipeline.storage.standard import _filters as storage_filters
+
 import json
 import math
 import unittest
@@ -196,9 +199,9 @@ class ConfigTests(unittest.TestCase):
             # file, so those two were set explicitly
             stale = {"KB_SEARCH_TOKEN": "old-token", "KB_SEARCH_RERANK_THRESHOLD": "0.1", "KB_SEARCH_TOP_K": "7",
                      "KB_SEARCH_GRAPH_K": "77", "KB_SEARCH_VECTOR_K": "33"}
-            fresh = {"settings": None, "search": None, "q": None, "q_key": None, "at": 0.0, "explicit": None}
+            fresh = {"settings": None, "search": None, "store": None, "at": 0.0, "explicit": None}
             with mock.patch.dict(os.environ, stale), mock.patch.dict(service._state, fresh), \
-                    mock.patch.object(service, "QdrantClient", side_effect=lambda **kw: SimpleNamespace(**kw)), \
+                    mock.patch("qdrant_client.QdrantClient", side_effect=lambda **kw: SimpleNamespace(**kw)), \
                     mock.patch.object(service, "load_settings", return_value=settings):
                 ss = service.runtime()[1]
                 self.assertEqual((ss.token, ss.rerank_threshold, ss.top_k, ss.graph_k, ss.vector_k), ("old-token", 0.1, 7, 77, 33))
@@ -214,13 +217,13 @@ class ConfigTests(unittest.TestCase):
                 ss = service.runtime()[1]
                 self.assertEqual((ss.token, ss.rerank_threshold), ("new-token", 0.3))          # file unreadable for a moment: the previous settings are kept, not the defaults
                 env_file.write_text("KB_SEARCH_TOKEN=new-token\nKB_SEARCH_RERANK_THRESHOLD=0.3\n", encoding="utf-8")
-                q = service.runtime()[2]
+                q = service.runtime()[2]._q
                 self.assertEqual((q.timeout, q.check_compatibility), (25, False))                # the timeout follows the search scale, not the 120 s used when building
                 service._state["at"] = 0.0
-                self.assertIs(service.runtime()[2], q)                                          # connection details unchanged: the client is not rebuilt
+                self.assertIs(service.runtime()[2]._q, q)                                          # connection details unchanged: the client is not rebuilt
                 settings.qdrant_url = "http://127.0.0.1:2"
                 service._state["at"] = 0.0
-                self.assertIsNot(service.runtime()[2], q)
+                self.assertIsNot(service.runtime()[2]._q, q)
 
 
     def test_service_reads_its_settings_once_at_startup(self) -> None:
@@ -518,12 +521,12 @@ class EvalsetTests(unittest.TestCase):
         def meta(q, collection, ids, **kw):
             asked.append(collection)
             return {i: {"active": collection == "c2" and i == "g2"} for i in ids}
-        with mock.patch.object(service, "runtime", return_value=(settings, _settings(), object())), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, _settings(), object())), \
                 mock.patch.object(channels, "point_meta", side_effect=meta):
             active = evalset._active_points(None)
             self.assertEqual(active({"q": "x", "kbs": ["kb_001", "kb_999"]}, ["g1", "g2"]), set()); self.assertEqual(asked, ["c1"])
             self.assertEqual(active({"q": "x"}, ["g1", "g2"]), {"g2"}); self.assertEqual(asked, ["c1", "c1", "c2"])   # no knowledge base named: look in all of them
-        with mock.patch.object(service, "runtime", return_value=(settings, _settings(), object())), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, _settings(), object())), \
                 mock.patch.object(channels, "point_meta", side_effect=RuntimeError("400: not a valid point id")):
             items = [{"q": "手写的题", "gold_point_ids": ["chunk-12"], "gold_docs": ["x/d1.pdf"]}]
             self.assertEqual(evalset.check_gold(items, evalset._active_points(None)), 0)
@@ -1233,7 +1236,7 @@ class OrchestrationTests(unittest.TestCase):
                 return [{"point_id": "p2", "score": 9.0, "payload": {"doc_id": "d1", "rel_path": "dir/d1.pdf"}}, {"point_id": "p1", "score": 7.0, "payload": {"doc_id": "d1", "rel_path": "dir/d1.pdf"}}] + list(extra_bm25 or [])
             return []
 
-        with mock.patch.object(service, "runtime", return_value=(settings, ss, object())), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, ss, object())), \
                 mock.patch.object(catalog_mod, "get_catalog", return_value=entries), \
                 mock.patch.object(channels, "embed_question", side_effect=lambda settings, question, timeout=10.0, instruction=None: [1.0, 0.0]), \
                 mock.patch.object(channels, "vector_channel", side_effect=fake_vec), \
@@ -1566,7 +1569,7 @@ class OrchestrationTests(unittest.TestCase):
             calls["graph"].append(source.kb_id); calls["lexical_only"] = lexical_only
             return {"chunks": [{"point_id": "p1", "score": 0.4, "entities": ["浓度"], "relations": []}], "entities": [], "relations": [], "specs": [], "pages": [], "graph_version": "v"}
 
-        with mock.patch.object(service, "runtime", return_value=(settings, ss, object())), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, ss, object())), \
                 mock.patch.object(catalog_mod, "get_catalog", return_value=[{"kb_id": "kb_001", "has_graph": True}]), \
                 mock.patch.object(channels, "embed_question", side_effect=RuntimeError("8101 down")), \
                 mock.patch.object(channels, "bm25_channel", return_value=[{"point_id": "p2", "score": 9.0, "payload": {"doc_id": "d1"}}, {"point_id": "p1", "score": 7.0, "payload": {"doc_id": "d1"}}]), \
@@ -1832,7 +1835,7 @@ class ApiTests(unittest.TestCase):
         from kb_search.main import create_app
 
         ss = _settings(token="secret")
-        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, SimpleNamespace(get_collections=lambda: None))), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(SimpleNamespace(sources={}), ss, SimpleNamespace(get_collections=lambda: None))), \
                 mock.patch.object(service, "search", return_value={"ok": 1}) as search_mock, \
                 mock.patch.object(service, "image", return_value={"bytes": b"PNG", "mime": "image/png", "source": "pdf-embedded", "width": 3, "height": 2}), \
                 mock.patch.object(service, "crop", return_value={"bytes": b"CROP", "mime": "image/png", "source": "cache", "width": 1, "height": 1, "box": [0, 0, 1, 1]}):
@@ -1869,7 +1872,7 @@ class ApiTests(unittest.TestCase):
 
         settings = SimpleNamespace(sources={"kb_001": SimpleNamespace(collection="kb_001")})
         q = SimpleNamespace(retrieve=mock.Mock(side_effect=AssertionError("must not ask the main store")))
-        with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), q)):
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, _settings(token="secret"), q)):
             client = TestClient(create_app(), raise_server_exceptions=False)
             auth = {"Authorization": "Bearer secret"}
             r = client.get("/image/kb_001/kb_001:12:abc:pdf-v12:blk:0", headers=auth)
@@ -1898,7 +1901,7 @@ class ApiTests(unittest.TestCase):
             def flush(self): pass
 
         out = Out()
-        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), _settings(token="secret"), None)), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(SimpleNamespace(sources={}), _settings(token="secret"), None)), \
                 mock.patch.object(service, "search", return_value={"question": "我的浓度多少", "retrieval_summary": summary}):
             client = TestClient(create_app())
             with contextlib.redirect_stdout(out):
@@ -1985,7 +1988,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual((nb["evidence"][0]["position"], nb["evidence"][0]["place"]), ("page 4 · 2. Roles", "page 4"))   # the position string and the short locator for citations, written like the sources of /search
         self.assertEqual((out["count"], out["total"], out["has_more"], out["kb_name"]), (1, 7, True, "reports"))   # the total is not bounded by limit: an incomplete answer shows
         ss = _settings(token="secret")
-        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, SimpleNamespace(get_collections=lambda: None))), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(SimpleNamespace(sources={}), ss, SimpleNamespace(get_collections=lambda: None))), \
                 mock.patch.object(service, "graph_neighbors", return_value={"found": True}) as gn:
             client = TestClient(create_app())
             r = client.post("/graph/neighbors", json={"kb_id": "kb_003", "entity": "DSE", "types": ["has_stage"], "direction": "out"}, headers={"Authorization": "Bearer secret"})
@@ -2069,7 +2072,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(driver.close.call_count, 0)                                                               # 共用的 driver 不关
         ss = _settings(token="secret")
         auth = {"Authorization": "Bearer secret"}
-        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, None)), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(SimpleNamespace(sources={}), ss, None)), \
                 mock.patch.object(service, "graph_entities", return_value={"total": 0}) as ge:
             client = TestClient(create_app())
             r = client.post("/graph/entities", json={"kb_id": "kb_005", "types": ["product"], "limit": 20, "offset": 40}, headers=auth)
@@ -2081,7 +2084,7 @@ class ApiTests(unittest.TestCase):
             r = client.post("/graph/entities", json={"kb_id": "kb_005", "uppers": ["agent"], "kind": "class"}, headers=auth)
             self.assertEqual((r.status_code, ge.call_args.kwargs["uppers"], ge.call_args.kwargs["kind"]), (200, ["agent"], "class"))
             self.assertEqual(client.post("/graph/entities", json={"kb_id": "kb_005"}).status_code, 401)
-        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, None)):
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(SimpleNamespace(sources={}), ss, None)):
             self.assertEqual(TestClient(create_app()).post("/graph/entities", json={"kb_id": "kb_009"}, headers=auth).status_code, 404)
 
     def test_graph_facts_by_subject_and_property(self) -> None:
@@ -2186,7 +2189,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual((miss["found"], miss["total"], miss["facts"], [c["id"] for c in miss["candidates"]]), (False, 0, [], ["e9"]))
         ss = _settings(token="secret")
         auth = {"Authorization": "Bearer secret"}
-        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={"kb_002": src}), ss, None)), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(SimpleNamespace(sources={"kb_002": src}), ss, None)), \
                 mock.patch.object(graphwalk, "list_facts", return_value={"total": 1}) as lf, \
                 mock.patch.object(channels, "shared_driver", return_value=driver):
             client = TestClient(create_app())
@@ -2214,7 +2217,7 @@ class ApiTests(unittest.TestCase):
         build it."""
         src = SimpleNamespace(kb_id="kb_005", collection="kb_005", source_root="products")
         q = SimpleNamespace(scroll=lambda **kw: ([SimpleNamespace(id="p1", payload=_payload("p1", "d1", 0, "body text"))], None))
-        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={"kb_005": src}), _settings(), q)):
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(SimpleNamespace(sources={"kb_005": src}), _settings(), q)):
             out = service.context("kb_005", "d1", 0, 0)
         self.assertEqual((out["kb_name"], len(out["sources"])), ("products", 1))
 
@@ -2260,7 +2263,7 @@ class ApiTests(unittest.TestCase):
             ])
             settings = SimpleNamespace(state_db=path, sources={"kb_005": SimpleNamespace(kb_id="kb_005", collection="kb_005", source_root="products")})
             auth = {"Authorization": "Bearer secret"}
-            with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), None)):
+            with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, _settings(token="secret"), None)):
                 client = TestClient(create_app())
                 r = client.post("/docs", json={"kb_id": "kb_005"}, headers=auth)
                 self.assertEqual(r.status_code, 200)
@@ -2404,7 +2407,7 @@ class ApiTests(unittest.TestCase):
             auth = {"Authorization": "Bearer secret"}
             ss = _settings(token="secret", channel_timeout=4.0)
             fake = FakeOS()
-            with mock.patch.object(service, "runtime", return_value=(settings, ss, None)), mock.patch.object(channels, "os_client", return_value=fake):
+            with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, ss, None)), mock.patch.object(channels, "os_client", return_value=fake):
                 client = TestClient(create_app())
                 r = client.post("/grep", json={"kb_id": "kb_005", "phrases": [" Widget X9 ", "no-such-term"], "fields": ["title", "body", "visual"],
                                                "doc_ids": ["kb_005:1", "kb_005:3"], "rel_paths": ["a.pdf"], "limit": 3}, headers=auth)
@@ -2455,7 +2458,7 @@ class ApiTests(unittest.TestCase):
             self.assertEqual((out["results"][0]["total_chunks"], out["results"][0]["hits"], missing.bodies), (0, [], []))
             self.assertEqual(out["degraded"], ["kb_005: keyword index kb_005 does not exist"])
             # the keyword index is unreachable: 503, not "nothing found"
-            with mock.patch.object(service, "runtime", return_value=(settings, ss, None)), \
+            with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, ss, None)), \
                     mock.patch.object(channels, "os_client", return_value=FakeOS(fail=ConnectionError("refused"))):
                 r = TestClient(create_app()).post("/grep", json={"kb_id": "kb_005", "phrases": ["a"]}, headers=auth)
                 self.assertEqual(r.status_code, 503); self.assertIn("opensearch", r.json()["detail"])
@@ -2507,7 +2510,7 @@ class ApiTests(unittest.TestCase):
             settings = SimpleNamespace(state_db=path, sources={"kb_002": src})
             auth = {"Authorization": "Bearer secret"}
             q = FakeQ()
-            with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), q)):
+            with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, _settings(token="secret"), q)):
                 client = TestClient(create_app())
                 post = lambda **body: client.post("/graph/pages", json={"kb_id": "kb_002", **body}, headers=auth)
                 out = post().json()
@@ -2545,7 +2548,7 @@ class ApiTests(unittest.TestCase):
             # no page collection: 404; the main store unreachable: 503
             gone = type("UnexpectedResponse", (Exception,), {"status_code": 404})("Not found: Collection doesn't exist")
             for err, code in ((gone, 404), (ConnectionError("refused"), 503)):
-                with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), FakeQ(fail=err))):
+                with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, _settings(token="secret"), FakeQ(fail=err))):
                     self.assertEqual(TestClient(create_app()).post("/graph/pages", json={"kb_id": "kb_002"}, headers=auth).status_code, code)
 
     def test_graph_facts_by_document_and_conflict_group(self) -> None:
@@ -2639,7 +2642,7 @@ class ApiTests(unittest.TestCase):
             _state_db(path, files=[{"kb_id": "kb_002", "file_key": 1, "rel_path": "reports/2024-03.pdf"}])
             settings = SimpleNamespace(state_db=path, sources={"kb_002": src})
             auth = {"Authorization": "Bearer secret"}
-            with mock.patch.object(service, "runtime", return_value=(settings, _settings(token="secret"), None)), \
+            with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, _settings(token="secret"), None)), \
                     mock.patch.object(graphwalk, "list_facts", return_value={"total": 1}) as lf, \
                     mock.patch.object(channels, "shared_driver", return_value=driver):
                 client = TestClient(create_app())
@@ -3373,11 +3376,11 @@ class TimeAwareSearchTests(unittest.TestCase):
     def test_search_excludes_non_current_documents_at_recall(self) -> None:
         from kb_pipeline.graph.currency import query_scope
 
-        flt, os_flt = service._kb_filters(None, ["报价/2024 报价.xlsx"])
+        flt, os_flt = storage_filters(None, ["报价/2024 报价.xlsx"])
         self.assertEqual([c.key for c in flt.must], ["is_active"])
         self.assertEqual((flt.must_not[0].key, flt.must_not[0].match.any), ("rel_path", ["报价/2024 报价.xlsx"]))
         self.assertEqual(os_flt, [{"bool": {"must_not": [{"terms": {"rel_path": ["报价/2024 报价.xlsx"]}}]}}])
-        flt2, _ = service._kb_filters({"doc_ids": ["d1"]}, None)
+        flt2, _ = storage_filters({"doc_ids": ["d1"]}, None)
         self.assertEqual(sorted(c.key for c in flt2.must), ["doc_id", "is_active"]); self.assertFalse(flt2.must_not)
         fused = service._fuse("kb_1", {"text": [], "bm25": [], "channels": {}, "degraded": []},
                               {"chunks": [{"point_id": "p1", "rel_path": "报价/2024 报价.xlsx", "score": 1.0},
@@ -3424,7 +3427,7 @@ class TimeAwareSearchTests(unittest.TestCase):
 
         ss = _settings(token="secret")
         auth = {"Authorization": "Bearer secret"}
-        with mock.patch.object(service, "runtime", return_value=(SimpleNamespace(sources={}), ss, None)), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(SimpleNamespace(sources={}), ss, None)), \
                 mock.patch.object(service, "graph_schema", return_value={"schema_id": "s1"}) as gs, \
                 mock.patch.object(service, "graph_stats", return_value={"stats": {}}) as gst:
             client = TestClient(create_app())
@@ -3442,7 +3445,7 @@ class TimeAwareSearchTests(unittest.TestCase):
         cfg = {"graph_schema_versions": [{"id": "s1", "origin": "auto_blank", "domain": "论文", "linkml": linkml},
                                          {"id": "s2", "origin": "upload", "linkml": linkml}], "graph_schema_active": "s2"}
         settings = SimpleNamespace(sources={"kb_003": SimpleNamespace(kb_id="kb_003", source_root="Example Collection B")}, state_db=":memory:")
-        with mock.patch.object(service, "runtime", return_value=(settings, _settings(), None)), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, _settings(), None)), \
                 mock.patch("kb_pipeline.db.connect") as connect, \
                 mock.patch("kb_pipeline.discovery.get_config", return_value=cfg), \
                 mock.patch.object(channels, "shared_driver", return_value=object()), \

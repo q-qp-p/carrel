@@ -63,6 +63,19 @@ class ApiLayerTests(unittest.TestCase):
         self.assertEqual(r.status_code, 500)
         self.assertIn("qdrant", r.json()["detail"])
 
+    def test_graph_build_modes(self) -> None:
+        from unittest import mock
+
+        trigger = mock.Mock(return_value={"started": True})
+        client = self._client(trigger_graph_build=trigger)
+        for payload, mode in ((None, "build"), ({}, "build"), ({"mode": "run"}, "run"),
+                              ({"mode": "rebuild"}, "rebuild")):
+            response = client.post("/api/kbs/kb_001/graph_build", json=payload)
+            self.assertEqual(response.status_code, 200)
+            trigger.assert_called_with("kb_001", mode=mode)
+        trigger.side_effect = ValueError("Unknown graph build mode")
+        self.assertEqual(client.post("/api/kbs/kb_001/graph_build", json={"mode": "invalid"}).status_code, 422)
+
     def test_cross_site_writes_are_rejected(self) -> None:
         from unittest import mock
 
@@ -530,7 +543,7 @@ class FileChunksDrawerTests(unittest.TestCase):
                 con.commit()
 
             class FakeQ:
-                def retrieve(self, collection_name, ids, with_payload=True, with_vectors=False):
+                def retrieve(self, collection_name, ids, with_payload=True, with_vectors=False, timeout=None):
                     pl = {"p0": {"text": "第一段", "token_count": 3, "block_type": "text", "block_id": "b0",
                                  "section_path": ["第一章"], "page_idx": 0},
                           "p1": {"text": "| a |", "token_count": 4, "block_type": "table", "block_id": "b1", "section_path": []}}
@@ -539,7 +552,7 @@ class FileChunksDrawerTests(unittest.TestCase):
             src = SimpleNamespace(kb_id=file.kb_id, collection=file.collection, max_tokens=400, overlap_tokens=80)
             cfg = SimpleNamespace(state_db=state, qdrant_url="http://x", qdrant_api_key="", sources={"k": src})
             with mock.patch.object(service, "settings", lambda: cfg), \
-                 mock.patch.object(service, "qdrant_client", lambda *a, **k: FakeQ()):
+                 mock.patch("kb_pipeline.storage.standard.vector_client", lambda *a, **k: FakeQ()):
                 r = service.file_chunks(file.kb_id, fid)
                 self.assertEqual([c["chunk_index"] for c in r["chunks"]], [0, 1])
                 self.assertEqual(r["chunks"][0]["text"], "第一段")

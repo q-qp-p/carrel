@@ -279,8 +279,36 @@ def init_db(path: str | Path) -> None:
         con.executescript(SCHEMA)
         migrate_schema(con)
         init_kb_sources_schema(con)
+        _migrate_llm_execution_settings(con)
         migrate_missing_source_jobs(con)
     _chmod_private(Path(path))
+
+
+def _migrate_llm_execution_settings(con: sqlite3.Connection) -> None:
+    """Adopt existing selections and limits once; new registrations are explicit."""
+    rows = con.execute("SELECT name FROM llm_registry WHERE multimodal IS NULL OR concurrency IS NULL").fetchall()
+    if not rows:
+        return
+    visual, graph = set(), set()
+    for source in con.execute("SELECT config_json FROM kb_sources"):
+        config = json.loads(source["config_json"] or "{}")
+        if config.get("vlm_model"):
+            visual.add(config["vlm_model"])
+        graph.update((config.get("graph_llm") or {}).values())
+    def legacy_limit(key: str, default: int) -> int:
+        try:
+            return max(1, min(256, int(os.getenv(key) or default)))
+        except ValueError:
+            return default
+    vision_limit = legacy_limit("VLM_CONCURRENCY", 1)
+    graph_limit = legacy_limit("KB_GRAPH_LLM_CONCURRENCY", 8)
+    for row in rows:
+        name = row["name"]
+        limit = vision_limit if name in visual else graph_limit
+        if name in visual and name in graph:
+            limit = min(vision_limit, graph_limit)
+        con.execute("UPDATE llm_registry SET multimodal=COALESCE(multimodal, ?), "
+                    "concurrency=COALESCE(concurrency, ?) WHERE name=?", (int(name in visual), limit, name))
 
 
 def _chmod_private(path: Path) -> None:
@@ -420,6 +448,8 @@ GRAPH_RECLAIMED_STALE = "Graph build heartbeat timed out"
 
 def boot_time() -> int | None:
     """When the current boot started (btime in /proc/stat); None when it cannot be read (not Linux)."""
+    if os.getenv("KB_RUNTIME") == "container" and os.getenv("KB_RUNTIME_BOOT_TIME"):
+        return int(os.environ["KB_RUNTIME_BOOT_TIME"])
     try:
         with open("/proc/stat", encoding="ascii") as fh:
             for line in fh:
@@ -1409,6 +1439,8 @@ _JOBS_MIGRATIONS = (
     # API protocol: openai = /chat/completions compatible; anthropic = /v1/messages
     "ALTER TABLE llm_registry ADD COLUMN protocol TEXT NOT NULL DEFAULT 'openai'",
     "ALTER TABLE llm_registry ADD COLUMN max_input_tokens INTEGER",
+    "ALTER TABLE llm_registry ADD COLUMN multimodal INTEGER",
+    "ALTER TABLE llm_registry ADD COLUMN concurrency INTEGER",
     # 建图进程身份:进程被杀/断电后,running 行靠它判定陈旧并回收
     "ALTER TABLE graph_builds ADD COLUMN worker_host TEXT",
     "ALTER TABLE graph_builds ADD COLUMN worker_pid INTEGER",
@@ -1550,22 +1582,26 @@ def upsert_llm(
     notes: str = "",
     builtin: bool = False,
     max_input_tokens: int | None = None,
+    multimodal: bool = False,
+    concurrency: int = 1,
 ) -> None:
     ts = now_ts()
     con.execute(
         """
-        INSERT INTO llm_registry(name, base_url, api_key, model_id, protocol, notes, builtin, created_at, updated_at, max_input_tokens)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO llm_registry(name, base_url, api_key, model_id, protocol, notes, builtin, created_at, updated_at, max_input_tokens, multimodal, concurrency)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
           base_url = excluded.base_url,
           api_key = CASE WHEN excluded.api_key != '' THEN excluded.api_key ELSE llm_registry.api_key END,
           model_id = excluded.model_id,
           protocol = excluded.protocol,
           max_input_tokens = excluded.max_input_tokens,
+          multimodal = excluded.multimodal,
+          concurrency = excluded.concurrency,
           notes = excluded.notes,
           updated_at = excluded.updated_at
         """,
-        (name, base_url, api_key, model_id, protocol, notes, 1 if builtin else 0, ts, ts, max_input_tokens),
+        (name, base_url, api_key, model_id, protocol, notes, 1 if builtin else 0, ts, ts, max_input_tokens, int(multimodal), concurrency),
     )
 
 

@@ -197,9 +197,9 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertIn("name: carrel", compose)
         self.assertNotIn("/home/", compose)
         self.assertNotIn("/Users/", compose)
-        for names in SERVICE_CONTAINERS.values():
+        for names in (SERVICE_CONTAINERS[key] for key in ("database", "mineru")):
             for name in names:
-                self.assertIn(f"container_name: {name}", compose, name)
+                self.assertIn("container_name: ${COMPOSE_PROJECT_NAME:-carrel}-" + name.removeprefix("carrel-"), compose, name)
         mineru = compose.split("\n  mineru:", 1)[1].split("\n  qdrant:", 1)[0]
         self.assertNotIn("gpus:", mineru)                          # the GPU reservation lives in the overlay
         self.assertIn("gpus: all", _read("deployment/compose/compose.gpu.yml"))
@@ -212,7 +212,7 @@ class DeploymentAssetTests(unittest.TestCase):
         self.assertIn('KB_HOST_HOUSEKEEPING:-0', _read("scripts/kb-cleanup.sh"))
         self.assertIn('pdf-images = ["pymupdf', _read("app/pyproject.toml"))
         deploy = _read("deploy.sh")
-        self.assertIn("--with-pdf-images) WITH_PDF_IMAGES=1", deploy)       # AGPL extra is opt-in
+        self.assertIn("--with-pdf-images) PDF=1; BUILD=1", deploy)       # AGPL extra is opt-in
         self.assertNotIn('app[pdf-images]" pytest', deploy)
         self.assertIn("checks[\"pdf_images\"]", _read("app/kb_search/service.py"))
         self.assertTrue((REPO / "THIRD_PARTY_LICENSES/Apache-2.0.txt").exists())
@@ -225,8 +225,8 @@ class DeploymentAssetTests(unittest.TestCase):
         ignore = _read(".gitignore")
         for rule in (".env", ".env.*", "*.env", "!*.env.example"):
             self.assertIn(rule + "\n", ignore)
-        self.assertIn("MINERU_FLAVOR=gpu", example)
-        self.assertIn("NEO4J_PASSWORD=\n", example)
+        self.assertIn("MINERU_FLAVOR=cpu", example)
+        self.assertIn("NEO4J_PASSWORD=CHANGE_ME\n", example)
 
     def test_mineru_detector_decides_from_policy_and_hardware(self) -> None:
         script = REPO / "deployment/compose/mineru/detect.py"

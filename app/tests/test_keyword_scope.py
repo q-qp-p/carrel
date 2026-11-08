@@ -1,4 +1,6 @@
 """Keyword navigation uses the same temporal boundaries as evidence search."""
+
+from storage_fakes import storage_runtime
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,7 +18,7 @@ def runtime(tmp_path):
     db.init_db(state)
     settings = SimpleNamespace(state_db=state, sources={'sample': SimpleNamespace(kb_id='sample', collection='sample', source_root='Sample')},
                                opensearch_url='http://unused')
-    with patch.object(service, 'runtime', return_value=(settings, SimpleNamespace(token='test-token', channel_timeout=3), None)):
+    with patch.object(service, 'runtime', return_value=storage_runtime(settings, SimpleNamespace(token='test-token', channel_timeout=3), None)):
         yield settings
 
 

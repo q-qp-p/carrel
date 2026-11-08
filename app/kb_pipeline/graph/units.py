@@ -281,7 +281,7 @@ def unit_id_for(kb_id: str, doc_id: str, text: str, chunk_uids: Iterable[str] = 
     return hashlib.sha256(raw).hexdigest()[:32]
 
 
-def fetch_chunk_payloads(q: Any, collection: str, ledger: Iterable[dict[str, Any]], *, batch: int = 256) -> list[ChunkRef]:
+def fetch_chunk_payloads(q: Any, collection: str, ledger: Iterable[dict[str, Any]], *, batch: int = 256, store: Any = None) -> list[ChunkRef]:
     """Fetch payloads (no vectors) from the main collection according to the frozen chunk ledger. Chunks that are
     in the ledger but no longer in the collection are skipped (a benign race between a delete job and the build)."""
     rows = [c for c in ledger if c.get("point_id")]
@@ -289,16 +289,19 @@ def fetch_chunk_payloads(q: Any, collection: str, ledger: Iterable[dict[str, Any
     out: list[ChunkRef] = []
     ids = list(by_point)
     for i in range(0, len(ids), batch):
-        points = q.retrieve(collection_name=collection, ids=ids[i:i + batch], with_vectors=False, with_payload=True)
-        for p in points:
-            payload = p.payload or {}
+        if store is not None:
+            records = store.payloads(collection, ids[i:i + batch], active_only=False).items()
+        else:
+            records = [(str(p.id), p.payload or {}) for p in q.retrieve(
+                collection_name=collection, ids=ids[i:i + batch], with_vectors=False, with_payload=True)]
+        for point_id, payload in records:
             text = payload_text(payload)
             if not text.strip():
                 continue
-            ref = by_point.get(str(p.id), {})
+            ref = by_point.get(str(point_id), {})
             section = [str(s) for s in (payload.get("section_path") or []) if str(s).strip()]
             out.append(ChunkRef(
-                point_id=str(p.id),
+                point_id=str(point_id),
                 chunk_uid=str(payload.get("chunk_uid") or ref.get("chunk_uid") or ""),
                 doc_id=str(payload.get("doc_id") or ref.get("doc_id") or ""),
                 content_version=str(payload.get("content_version") or ref.get("content_version") or ""),

@@ -101,9 +101,9 @@ Image queries keep a shared top-K for text and visual hits. When graph explorati
 
 ### Ranking and temporal scope
 
-With `VISUAL_RERANKER_BASE_URL` configured and `KB_SEARCH_RERANK` enabled, image candidates receive pixel-based scores alongside text reranking. Each branch applies its own relevance gate; successfully scored images appear only in the image branch. Accepted branch ranks are fused by RRF. Missing image scores fall back to text, while low image relevance remains a rejection. See the [retrieval guide](../../../docs/retrieval.md#text-and-image-reranking) for budgets and thresholds.
+With `VISUAL_RERANKER_BASE_URL` configured and `KB_SEARCH_RERANK` enabled, image candidates receive pixel-based scores alongside text reranking. Candidates passing the image gate use the image branch; otherwise matching captions can use text. Queries containing pixels can also retain visual-recall evidence. Each candidate contributes one branch rank to RRF, weighted down when close to that branch's relevance threshold. Missing image scores fall back to text and report degradation; a low image score remains visible alongside the independent evidence supporting the candidate. See the [retrieval guide](../../../docs/retrieval.md#text-and-image-reranking) for budgets and thresholds.
 
-`retrieval_summary.ranking` reports `method` (`text` or `rrf`), `text.status/scored`, `visual.status/requested/scored/threshold` and, when fusion runs, `fusion.status/constant/accepted`. Sources carry `ranking.branch/rank` and scores such as `score_rerank_visual` and `score_fusion`. Neither rank scores nor `accepted` are factual-confidence probabilities.
+`retrieval_summary.ranking` reports `method` (`text` or `rrf`), `text.status/scored`, `visual.status/requested/scored/threshold` and, when fusion runs, `fusion.status/constant/accepted`. Sources carry `ranking.branch/rank/accepted_by` and scores such as `score_rerank_visual` and `score_fusion`. The supporting gates in `accepted_by` are `text`, `visual`, and `visual_recall`; each candidate occupies only one ranking branch. Neither rank scores nor `accepted` are factual-confidence probabilities.
 
 `search`, `neighbors` and `facts` share these temporal modes:
 

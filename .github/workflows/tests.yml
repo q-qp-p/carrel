@@ -25,8 +25,9 @@ jobs:
           cache-dependency-path: |
             app/requirements.lock
             app/requirements-pdf-images.lock
-      - name: Install the app with the optional pdf-images extra
-        run: python -m pip install -r app/requirements.lock -r app/requirements-pdf-images.lock -e "app[pdf-images]"
+            app/requirements-light.lock
+      - name: Install the app with the optional pdf-images and light extras
+        run: python -m pip install -r app/requirements.lock -r app/requirements-pdf-images.lock -r app/requirements-light.lock -e "app[pdf-images,light]"
       - name: Run the test suite
         working-directory: app
         run: python -m pytest -q

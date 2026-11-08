@@ -104,7 +104,7 @@ def test_scan_withdraws_indexed_source_replaced_by_pointer_and_restores_without_
         assert remove() == (1, 1)
         assert remove() == (0, 0)
         h.con.commit()
-        with patch.object(worker, 'qdrant_client'), patch.object(worker, 'mark_file_inactive') as withdraw, \
+        with patch("kb_pipeline.storage.standard.vector_client"), patch("kb_pipeline.storage.standard.qdrant.mark_file_inactive") as withdraw, \
                 patch.object(worker, '_sync_fts_doc') as fts:
             assert worker.run_once(h.con, settings=h.settings).startswith('delete-done:')
             withdraw.assert_called_once(); fts.assert_called_once()
@@ -115,8 +115,8 @@ def test_scan_withdraws_indexed_source_replaced_by_pointer_and_restores_without_
         change, job = _rescan(h)
         assert change == 'metadata_changed' and job
         assert _rescan(h)[1] is None
-        with patch.object(worker, 'qdrant_client'), patch.object(worker, 'file_version_point_count', return_value=1), \
-                patch.object(worker, 'reactivate_file_metadata') as restore, patch.object(worker, '_sync_fts_doc'):
+        with patch("kb_pipeline.storage.standard.vector_client"), patch("kb_pipeline.storage.standard.qdrant.file_version_point_count", return_value=1), \
+                patch("kb_pipeline.storage.standard.qdrant.reactivate_file_metadata") as restore, patch.object(worker, '_sync_fts_doc'):
             assert worker.run_once(h.con, settings=h.settings).startswith('metadata-done:')
             restore.assert_called_once()
         h.con.commit()

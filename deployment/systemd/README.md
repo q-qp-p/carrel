@@ -1,8 +1,10 @@
 # systemd user units
 
-On Linux the app runs as user-scope systemd units: two long-running services
-(console, search API) and six timers that drive ingestion and maintenance.
-`deploy.sh` installs and enables them; this page is the reference.
+Native Linux installations can run the app as user-scope systemd units: two
+long-running services (console, search API) and six timers for ingestion and
+maintenance. Install them with `scripts/install-systemd.sh` after preparing the
+Python environment and application configuration. `deploy.sh` now starts
+[containers](../compose/README.md), which include their own scheduler.
 
 ## Units
 
@@ -90,7 +92,7 @@ under `app/kb_server/static/` need no restart.
 
 ## Without systemd
 
-macOS and containers have no user systemd. `deploy.sh` prints the equivalent
-manual commands (console, search API, one ingest round); a cron entry or a
-launchd agent calling `scripts/kb-pipeline-scan.sh` and
-`scripts/kb-pipeline-worker-once.sh` gives the same behaviour.
+Container deployments run the console, search API and scheduler inside the app
+container. For native macOS installations, cron or launchd can call
+`scripts/kb-pipeline-scan.sh` and `scripts/kb-pipeline-worker-once.sh`, with
+`python -m kb_server` and `python -m kb_search` running as separate services.

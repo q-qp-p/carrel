@@ -1,4 +1,6 @@
 """Synthetic contracts for independent evidence retrieval and graph discovery."""
+
+from storage_fakes import storage_runtime
 from dataclasses import replace
 from types import SimpleNamespace
 import time
@@ -248,9 +250,9 @@ class IdentityAndDateTests(unittest.TestCase):
     def test_context_can_read_later_retrospective_document(self):
         settings = SimpleNamespace(sources={"kb": SimpleNamespace(kb_id="kb", collection="test", source_root="docs")})
         payload = {"doc_id": "d", "point_id": "p", "rel_path": "2027-01-01.md", "text": "A later statement", "chunk_index": 1}
-        with mock.patch.object(service, "runtime", return_value=(settings, load_search_settings({}), object())), \
+        with mock.patch.object(service, "runtime", return_value=storage_runtime(settings, load_search_settings({}), object())), \
              mock.patch.object(channels, "context_range", return_value=[payload]), \
-             mock.patch.object(service, "_graph_driver", return_value=None), \
+             mock.patch("kb_pipeline.storage.standard.StandardGraph.optional_driver", return_value=None), \
              mock.patch.object(service.catalog_mod, "get_catalog", return_value=[]):
             result = service.context("kb", "d", 1, 1, as_of="2026")
         self.assertEqual(result["sources"][0]["text"], "A later statement")

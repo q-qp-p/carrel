@@ -36,3 +36,6 @@ models/
 
 # Per-library correction rules belong to the installation
 config/corrections/
+
+# Container application data
+/data/

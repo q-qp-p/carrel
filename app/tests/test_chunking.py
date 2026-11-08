@@ -260,11 +260,11 @@ class ChunkDiagnosticsTests(unittest.TestCase):
         self.assertIn('<button data-tab="graph">图谱预览</button>', html)
         self.assertIn('<button data-tab="config">配置管理</button>', html)
         self.assertIn('<button data-tab="files">文件管理<span class="n" id="tabn-files"></span></button>', html)
-        # the four buttons build / merge / pause / delete go back to the knowledge-graph section of config
+        # The unified build/pause/resume action, full rebuild and delete belong in config
         # management; the graph preview tab keeps only the status card and the preview
         graph_tab = html.split('id="tab-graph"', 1)[1].split('id="tab-config"', 1)[0]
         config_tab = html.split('id="tab-config"', 1)[1]
-        for bid in ('id="cfg-gbuild"', 'id="cfg-gappend"', 'id="cfg-gpause"', 'id="cfg-gdelete"'):
+        for bid in ('id="cfg-gbuild"', 'id="cfg-grebuild"', 'id="cfg-gdelete"'):
             self.assertNotIn(bid, graph_tab, bid)
             self.assertIn(bid, config_tab, bid)
         for gone in ('id="tab-chunks"', 'id="tab-jobs"', 'id="pv-run"', 'id="cfg-preview"', 'id="jb-list"'):

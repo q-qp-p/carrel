@@ -10,16 +10,12 @@ import time
 import traceback
 
 from .. import db
-from .. import search_fts
+from ..storage import get_storage
 from ..config import Settings
 from ..parsers.errors import JobPaused, service_unreachable
 from ..parsers.source_guard import MissingSourceContent
 from ..utils import looks_like_worker_command
 from .parse_job import JobCancelled, process_parse_job
-from ..vector.qdrant import client as qdrant_client
-from ..vector.qdrant import (
-    file_version_point_count, mark_file_inactive, reactivate_file_metadata, update_file_metadata,
-)
 
 
 def worker_id() -> str:
@@ -72,6 +68,11 @@ def run_once(
         )
         heartbeat.start()
     try:
+        # Read after the committed claim: the console sees this running job and
+        # cannot change its embedding configuration while it is being used.
+        if settings is not None and not dry_run:
+            from ..model_endpoints import apply_overrides
+            settings = apply_overrides(settings)
         if dry_run:
             db.release_job(con, job["job_id"])
             return f"dry-run-claimed:{job['job_id']}:{job_type}:kb={job['kb_id']}"
@@ -80,13 +81,13 @@ def run_once(
                 file_row = db.get_file_by_id(con, str(job["file_id"]))
                 if file_row:
                     payload = json.loads(str(job["payload_json"] or "{}"))
-                    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+                    store = get_storage(settings)
                     if payload.get("reactivate"):
                         # A file that returned after deletion is restored through this path without re-parsing.
                         # Once the Qdrant points are flipped back to active, the SQLite chunk ledger must follow,
                         # otherwise the file is searchable but never enters the graph -- and since the ledger
                         # did not change, the rebuild policy cannot notice either.
-                        remaining = file_version_point_count(q, file_row)
+                        remaining = store.chunks.version_count(file_row)
                         # Only flip back the points (by id) that were active at the moment of deletion / KB close:
                         # old chunks replaced within the same version stay inactive. Flipping a whole version
                         # would revive every chunking ever done (2026-09-06 close-and-reopen: the chunk ledger
@@ -95,7 +96,7 @@ def run_once(
                             con, str(file_row["file_id"]), str(file_row["content_version"])
                         )
                         if remaining > 0 and restore_ids:
-                            reactivate_file_metadata(q, file_row, point_ids=restore_ids)
+                            store.chunks.reactivate(file_row, point_ids=restore_ids)
                             db.mark_chunks_active(
                                 con, str(file_row["file_id"]), str(file_row["content_version"])
                             )
@@ -118,8 +119,8 @@ def run_once(
                                 flush=True,
                             )
                     else:
-                        update_file_metadata(q, file_row)
-                    _sync_fts_doc(settings, q, file_row)
+                        store.chunks.update_metadata(file_row)
+                    _sync_fts_doc(store, file_row)
                     if str(file_row["indexed_version"] or "") == str(file_row["content_version"] or ""):
                         db.mark_file_indexed(con, str(file_row["file_id"]), str(file_row["content_version"]))
             db.mark_job_done(con, job["job_id"], current_worker_id)
@@ -136,8 +137,8 @@ def run_once(
                 wanted = str(payload.get("content_version") or "")
                 if (file_row and str(file_row["status"]) != "deleted"
                         and (not wanted or wanted == str(file_row["content_version"] or ""))):
-                    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-                    _sync_fts_doc(settings, q, file_row)
+                    store = get_storage(settings)
+                    _sync_fts_doc(store, file_row)
                     print(f"[fts] compensation synced file={file_row['source_path']}", flush=True)
                 else:
                     print(f"[fts] compensation superseded job={job['job_id']}", flush=True)
@@ -150,9 +151,9 @@ def run_once(
             if settings:
                 file_row = db.get_file_by_id(con, str(job["file_id"]))
                 if file_row and str(file_row["status"]) == "deleted":
-                    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-                    mark_file_inactive(q, file_row)
-                    _sync_fts_doc(settings, q, file_row)
+                    store = get_storage(settings)
+                    store.chunks.deactivate(file_row)
+                    _sync_fts_doc(store, file_row)
                     # Only the batch active right now is marked deleted (only that batch comes back on restore);
                     # old chunks of the same version stay inactive
                     deleted_chunks = db.mark_chunks_deleted(con, str(file_row["file_id"]))
@@ -294,10 +295,8 @@ def _retry_delay_seconds(job: sqlite3.Row, settings: Settings | None) -> int:
     return max(1, min(settings.job_retry_max_seconds, delay))
 
 
-def _sync_fts_doc(settings: Settings, q, file_row: sqlite3.Row) -> None:
-    result = search_fts.sync_doc_from_qdrant(
-        url=settings.opensearch_url,
-        qdrant=q,
+def _sync_fts_doc(store, file_row: sqlite3.Row) -> None:
+    result = store.keywords.sync_document(
         collection=str(file_row["collection"]),
         doc_id=f"{file_row['kb_id']}:{file_row['file_key']}",
     )

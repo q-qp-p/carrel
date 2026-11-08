@@ -1,6 +1,6 @@
 [project]
 name = "carrel"
-version = "0.4.1"
+version = "0.4.2"
 description = "Carrel: Ontology-Augmented Generation for AI agents. Local knowledge-base ingestion pipeline, console and search service."
 license = "MIT"
 requires-python = ">=3.12"
@@ -32,6 +32,8 @@ dependencies = [
 # (kb_search/images.py). PyMuPDF is AGPL-3.0 / commercial dual licensed; without
 # it the service falls back to the parser's cached images and /health says so.
 pdf-images = ["pymupdf>=1.24,<2"]   # pinned in requirements-pdf-images.lock
+# Embedded LanceDB/DuckDB storage for the Light deployment edition.
+light = ["lancedb>=0.41.0,<0.42", "duckdb>=2.0.0,<3", "pyarrow>=22.0.0,<23"]
 
 [project.scripts]
 # `kb` is the historical name used throughout the scripts and units; `carrel`
@@ -46,7 +48,7 @@ kb_server = ["static/*", "static/vendor/*", "static/vendor/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["kb_pipeline*", "kb_server*", "kb_search*"]
+include = ["kb_pipeline*", "kb_server*", "kb_search*", "kb_runtime*"]
 
 [tool.pytest.ini_options]
 # Plain `pytest` runs the whole suite; no .pytest_cache in the repo.

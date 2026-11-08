@@ -195,3 +195,23 @@ def test_pause_route_rejects_unknown_and_inactive_kbs(tmp_path, monkeypatch):
         h.con.commit()
         assert client.post(f"/api/kbs/{h.kb_id}/parse_pause").status_code == 422
         assert not db.parse_is_paused(h.con, h.kb_id)
+
+
+def test_manual_start_expedites_only_pending_parse_jobs(tmp_path, monkeypatch):
+    with _parse_harness(str(tmp_path)) as h:
+        monkeypatch.setattr(service, 'settings', lambda: h.settings)
+        monkeypatch.setattr(service, 'kick_scan', lambda: 'systemd')
+        monkeypatch.setattr(service, 'kick_worker', lambda: 'systemd')
+        h.con.execute("UPDATE jobs SET status='retry',next_attempt_at=9999999999 WHERE job_id=?", (h.job_id,))
+        h.con.execute("INSERT INTO jobs(job_id,kb_id,collection,job_type,status,next_attempt_at,created_at,updated_at) "
+                      "VALUES('other','other','other','parse','retry',9999999999,0,0)")
+        h.con.commit()
+        stats = service._kb_stats(h.con, h.kb_id)
+        assert stats['jobs_running'] == 0 and stats['jobs_queued'] == 1
+        service.parse_now(h.kb_id)
+        assert job(h)['next_attempt_at'] == 0
+        assert h.con.execute("SELECT next_attempt_at FROM jobs WHERE job_id='other'").fetchone()[0] == 9999999999
+        h.con.execute("UPDATE jobs SET status='running' WHERE job_id=?", (h.job_id,))
+        h.con.commit()
+        stats = service._kb_stats(h.con, h.kb_id)
+        assert stats['jobs_running'] == 1 and stats['jobs_queued'] == 0

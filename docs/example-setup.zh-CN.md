@@ -6,7 +6,7 @@ Carrel 的组件比较多，完整的本地部署对机器也有一定要求。�
 
 ## 机器
 
-**服务器：** 一台 NVIDIA DGX Spark（GB10，128 GB 统一内存，Ubuntu 24.04），所有服务都在这台机器上：控制台、检索服务、定时任务、各类存储、解析服务和全部模型服务。组件与 `./deploy.sh --with-local-models` 安装的相同。
+**服务器：** 一台 NVIDIA DGX Spark（GB10，128 GB 统一内存，Ubuntu 24.04），所有服务都在这台机器上：控制台、检索服务、定时任务、各类存储、解析服务和全部模型服务。这套部署中的模型服务独立于 Carrel 管理。
 
 **Mac：** 作者日常使用的电脑。资料放在 iCloud 云盘的「知识库」文件夹里，由这台 Mac 推送到服务器；作者也在这台 Mac 上通过 Codex 提问。
 
@@ -58,7 +58,7 @@ Mac 上有两个每分钟运行一次的 LaunchAgent：一个请 iCloud 把只�
 
 试用 Carrel 并不需要上面的全部组件。
 
-- **没有 GPU，或显存较小：** 不加 `--with-local-models`，把模型接口指向服务商即可，解析服务也可以在 CPU 上运行。见 [模型接口](configuration.zh-CN.md#模型接口)。
+- **没有 GPU，或显存较小：** 把模型接口指向服务商即可，解析服务也可以在 CPU 上运行。见 [模型接口](configuration.zh-CN.md#模型接口)。
 - **不建图：** 图谱是每个知识库的可选项，不建图就不需要对话模型。
 - **资料本来就在服务器上：** 直接放进 `runtime/mirror/<目录名>/`，或者用 `KB_MIRROR_ROOT` 指向挂载的共享目录，就不需要同步了。
 - **其他同步工具：** Linux 上的 rsync、Syncthing 或网络共享都可以。见 [资料目录](configuration.zh-CN.md#资料目录)。

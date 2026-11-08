@@ -121,7 +121,9 @@ def rerank_images(settings: Any, question: str, candidates: list[dict[str, Any]]
             errors.append("budget")
             break
         try:
-            client = Reranker(settings.visual_reranker_base_url, timeout=remaining)
+            client = Reranker(settings.visual_reranker_base_url,
+                              model_id=getattr(settings, "visual_reranker_model_id", ""),
+                              api_key=getattr(settings, "visual_reranker_api_key", ""), timeout=remaining)
             client.resolve_model()
             client.timeout = max(0.001, until - time.time())
             if time.time() >= until:

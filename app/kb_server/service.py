@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from kb_pipeline import db, discovery, search_fts
+from kb_pipeline import db, discovery
 from kb_pipeline.llm_compat import CompatibleRequest, endpoint_url, generation_parameters
 from kb_pipeline.progress import job_view, read_progress
 from kb_pipeline.config import (
@@ -38,8 +38,7 @@ from kb_pipeline.pipeline.scheduler import (
     schedule_deletes_for_source,
 )
 from kb_pipeline.graph.lock import build_lock_held, build_lock_path
-from kb_pipeline.vector.qdrant import client as qdrant_client
-from kb_pipeline.vector.qdrant import ensure_collection
+from kb_pipeline.storage import get_storage
 
 _last_kick: dict[str, float] = {}
 
@@ -88,6 +87,10 @@ def kick(unit: str, fallback_script: str | None = None, *, min_interval: float =
     if now - _last_kick.get(unit, 0.0) < min_interval:
         return "recently-kicked"
     _last_kick[unit] = now
+    if os.getenv("KB_RUNTIME") == "container":
+        from kb_runtime.queue import UNITS, enqueue
+        enqueue(UNITS[unit])
+        return "container-queue"
     try:
         proc = subprocess.run(
             ["systemctl", "--user", "start", "--no-block", unit],
@@ -136,11 +139,30 @@ _dir_count_cache: dict[str, tuple[float, int]] = {}
 # request thread and takes minutes for a large one: overview reports "deleting" from this set, so it shows
 # after a page reload or in another browser as well
 _KB_DELETING: set[str] = set()
-_rebuild_check_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_rebuild_check_cache: dict[str, tuple[float, dict[str, Any], object]] = {}
 REBUILD_CHECK_TTL = 60.0
 
 
-def rebuild_check_cached(cfg, kb_id: str, *, now: float | None = None) -> dict[str, Any] | None:
+def _graph_run_decision(cfg, kb_id: str, source, *, rebuild=None) -> dict[str, Any]:
+    """Manual readiness uses the pipeline's corpus checks, independently of the append timer."""
+    from kb_pipeline.graph.build import evaluate_append, evaluate_rebuild
+
+    append = evaluate_append(cfg, source_key=kb_id, source=source, ignore_auto_flag=True)
+    if append.get("reason") == "no_successful_build":
+        return {"kind": "build", "reason": "no_successful_build"}
+    if append.get("reason") in ("disabled", "paused_by_operator", "no_active_content",
+                               "llm_not_configured", "invalid_corrections", "config_changed_needs_full_rebuild"):
+        return {"kind": "none", "reason": append["reason"]}
+    if rebuild is None:
+        rebuild = evaluate_rebuild(cfg, source_key=kb_id, source=source)
+    if rebuild.get("due"):
+        return {"kind": "build", "reason": "rebuild_due"}
+    if append.get("due"):
+        return {"kind": "append"}
+    return {"kind": "none", "reason": append.get("reason", "source_unchanged")}
+
+
+def rebuild_check_cached(cfg, kb_id: str, *, now: float | None = None, revision=None) -> dict[str, Any] | None:
     """Current progress against the auto-rebuild conditions (days since the last full rebuild / threshold, new
     chunks / threshold): the very check the timer runs every two hours (evaluate_rebuild), drawn by the
     console as one line under the policy row. One evaluation compares the chunk ledger of the whole knowledge
@@ -153,17 +175,18 @@ def rebuild_check_cached(cfg, kb_id: str, *, now: float | None = None) -> dict[s
         return None
     ts = time.time() if now is None else float(now)
     hit = _rebuild_check_cache.get(kb_id)
-    if hit is not None and ts - hit[0] < REBUILD_CHECK_TTL:
+    if hit is not None and ts - hit[0] < REBUILD_CHECK_TTL and hit[2] == revision:
         return hit[1]
     from kb_pipeline.graph.build import evaluate_rebuild
 
     try:
         result = evaluate_rebuild(cfg, source_key=kb_id, source=source)
+        result["manual_run"] = _graph_run_decision(cfg, kb_id, source, rebuild=result)
     except Exception as exc:
         result = {"source": kb_id, "due": False, "reason": "check_failed", "error": repr(exc)}
     keep = {k: result.get(k) for k in ("due", "reason", "skipped_reason", "operator", "appends_since_full",
-                                       "baseline_graph_version", "conditions") if k in result}
-    _rebuild_check_cache[kb_id] = (ts, keep)
+                                       "baseline_graph_version", "conditions", "manual_run") if k in result}
+    _rebuild_check_cache[kb_id] = (ts, keep, revision)
     return keep
 
 
@@ -198,6 +221,10 @@ def _graph_status(con, kb_id: str, dir_name: str, config: dict[str, Any]) -> str
     """Graph build status, using the same vocabulary as the parse status dot: disabled (graph build not
     turned on) / pending (turned on, not built yet) / running (build in progress) / ok (built) /
     failed (last build failed) / stopped (interrupted, cache still there)."""
+    if os.getenv('KB_RUNTIME') == 'container':
+        from kb_runtime.queue import active_graph
+        if active_graph(kb_id):
+            return 'running'
     effective = dict(discovery.DEFAULTS)
     effective.update(discovery.DIR_DEFAULTS.get(dir_name, {}))
     effective.update(config)
@@ -281,6 +308,12 @@ def _graph_build_info(con, kb_id: str, collection: str = "") -> dict[str, Any] |
         "WHERE kb_id=? AND status != 'rolled_back' ORDER BY started_at DESC LIMIT 1",
         (kb_id,),
     ).fetchone()
+    if os.getenv('KB_RUNTIME') == 'container' and (row is None or row['status'] != 'running'):
+        from kb_runtime.queue import active_graph
+        request = active_graph(kb_id)
+        if request:
+            return {'status': 'running', 'stage': 'queued', 'started_at': int(request['created']),
+                    'progress': {}, 'queued': True, 'paused': False}
     if row is None:
         return None
     info = dict(row)
@@ -470,9 +503,16 @@ def overview() -> dict[str, Any]:
                 # 2.5-second poll: the frontend only reads config via /kbs/{id}/config, so here it was pure
                 # bandwidth waste.
                 entry["graph_status"] = _graph_status(con, entry["kb_id"], name, kb_config)
+                entry["graph_paused"] = bool(kb_config.get("graph_paused"))
                 entry["graph_build"] = _graph_build_info(
                     con, entry["kb_id"], str(row["collection"]))
-                entry["rebuild_check"] = rebuild_check_cached(cfg, entry["kb_id"])
+                graph_build = entry["graph_build"] or {}
+                revision = None if stats["jobs_active"] or entry["graph_status"] == "running" else (
+                    stats["files_indexed"], stats["files_pending"], stats["files_reparsing"],
+                    stats["jobs_revision"], entry["graph_status"], graph_build.get("graph_version"),
+                    graph_build.get("status"), row["config_json"],
+                )
+                entry["rebuild_check"] = rebuild_check_cached(cfg, entry["kb_id"], revision=revision)
                 # Once the switch is off graph_status becomes disabled, but artifacts may still exist (turned
                 # off mid-build, or the last delete failed). The frontend uses this to decide whether
                 # "Delete knowledge graph" is clickable, so an existing graph never becomes an orphan that
@@ -661,6 +701,9 @@ def _kb_stats(con, kb_id: str) -> dict[str, int]:
         f"SELECT COUNT(*) FROM jobs WHERE kb_id=? AND job_type='parse' AND {_WAITING_SQL}",
         kb_id, now_ts,
     )
+    jobs_running = one("SELECT COUNT(*) FROM jobs WHERE kb_id=? AND job_type='parse' AND status='running'", kb_id)
+    jobs_queued = one("SELECT COUNT(*) FROM jobs WHERE kb_id=? AND job_type='parse' AND status IN ('queued','retry')", kb_id)
+    jobs_revision = one("SELECT COALESCE(MAX(updated_at),0) FROM jobs WHERE kb_id=? AND job_type='parse'", kb_id)
     # A full re-parse overwrites in place: files stay indexed throughout. The progress bar has to subtract
     # the "indexed but being re-parsed" files from the completed count, otherwise a re-parse shows 100%
     # from the very start.
@@ -672,12 +715,13 @@ def _kb_stats(con, kb_id: str) -> dict[str, int]:
         kb_id,
     )
     if db.parse_is_paused(con, kb_id):
-        jobs_active = one("SELECT COUNT(*) FROM jobs WHERE kb_id=? AND job_type='parse' AND status='running'", kb_id)
+        jobs_active = jobs_running
         jobs_waiting = 0
     pending = max(0, total - indexed - failed)
     return {"files_total": total, "files_indexed": indexed, "files_failed": failed,
             "files_pending": pending, "jobs_active": jobs_active,
-            "jobs_waiting": jobs_waiting, "files_reparsing": reparsing}
+            "jobs_waiting": jobs_waiting, "jobs_running": jobs_running, "jobs_queued": jobs_queued,
+            "jobs_revision": jobs_revision, "files_reparsing": reparsing}
 
 
 def kb_files(kb_id: str) -> list[dict[str, Any]]:
@@ -919,13 +963,13 @@ def enroll(dir_name: str, config: dict[str, Any] | None = None) -> dict[str, Any
     # 主库 collection 由首个解析任务懒建,能自愈。
     warnings: list[str] = []
     created: Any = None
-    q = qdrant_client(cfg.qdrant_url, cfg.qdrant_api_key)
+    store = get_storage(cfg)
     try:
-        created = ensure_collection(q, source.collection, cfg.vector_layout)
+        created = store.chunks.ensure(source.collection, cfg.vector_layout)
     except Exception as exc:
         warnings.append(f"Vector collection creation failed ({exc.__class__.__name__}); it is recreated automatically at the first parse")
     try:
-        search_fts.ensure_indices(cfg.opensearch_url, [source.collection])
+        store.keywords.ensure([source.collection])
     except Exception as exc:
         warnings.append(f"Keyword index creation failed ({exc.__class__.__name__}); it is retried when parse results are written")
     kick_scan()
@@ -945,6 +989,9 @@ def delete_kb(kb_id: str) -> dict[str, Any]:
         raise ValueError("This knowledge base is already being deleted; wait for it to finish")
     _KB_DELETING.add(kb_id)
     try:
+        if os.getenv('KB_RUNTIME') == 'container':
+            from kb_runtime.queue import cancel_graph
+            cancel_graph(kb_id)
         _forget_graph_json(kb_id)
         return delete_kb_now(settings(), kb_id=kb_id)
     except PartialDeleteError as exc:
@@ -1117,6 +1164,8 @@ def _validate_config(con, effective: dict[str, Any], updates: dict[str, Any], li
             errors.append(f"Multimodal model {name!r} is not in the registry")
         elif str(model["protocol"] or "openai") != "openai":
             errors.append("Multimodal models require the OpenAI-compatible protocol")
+        elif not model["multimodal"]:
+            errors.append("Selected model is not marked as multimodal")
     graph_llm = updates.get("graph_llm")
     if isinstance(graph_llm, dict):
         from kb_pipeline.graph.build import GRAPH_LLM_STEPS, GRAPH_TUNE_STEP
@@ -1365,6 +1414,9 @@ def update_kb_config(kb_id: str, updates: dict[str, Any]) -> dict[str, Any]:
                 task["acknowledged"] = True
                 db.set_app_config(con, SUGGEST_TASK_PREFIX + kb_id, task)
     if updates.get("graph_enabled") is False:
+        if os.getenv('KB_RUNTIME') == 'container':
+            from kb_runtime.queue import cancel_graph
+            cancel_graph(kb_id)
         from .schema_tasks import cancel, summary
         with db.connect(cfg.state_db) as con:
             task = summary(con, kb_id)
@@ -1410,6 +1462,9 @@ def parse_now(kb_id: str) -> dict[str, Any]:
             raise ValueError("The knowledge base is not enabled")
         resumed = db.parse_is_paused(con, kb_id)
         discovery.set_config(con, kb_id, {"parse_paused": None})
+        # A manual start/resume should not wait for an existing queue/retry delay.
+        con.execute("UPDATE jobs SET next_attempt_at=0 WHERE kb_id=? AND job_type='parse' "
+                    "AND status IN ('queued','retry')", (kb_id,))
     scan_kick, worker_kick = kick_scan(), kick_worker()
     if "unavailable" in (scan_kick, worker_kick):
         # When both systemd and the script fallback failed, this used to return kicked=true anyway and the
@@ -1442,6 +1497,11 @@ BATCH_OOM_SCORE = ["/bin/sh", "-c", '{ echo 200 > /proc/self/oom_score_adj; } 2>
 
 def _spawn_graph_build(cfg: Settings, kb_id: str, *, graph_version: str | None = None,
                        append: bool = False, force: bool = False) -> dict[str, Any]:
+    if os.getenv("KB_RUNTIME") == "container":
+        from kb_runtime.queue import enqueue
+        request_id = enqueue("graph-build", {"kb_id": kb_id, "graph_version": graph_version, "append": append, "force": force})
+        return {"started": True, "queued": True, "request_id": request_id, "detached": "container-runtime",
+                "resumed": graph_version, "append": append}
     base_dir = cfg.state_db.parent.parent.parent
     py = base_dir / "app" / ".venv" / "bin" / "python"
     env_file = os.environ.get("KB_ENV_FILE") or str(base_dir / "config" / "knowledge-base.env")
@@ -1513,6 +1573,12 @@ def pause_graph_build(kb_id: str) -> dict[str, Any]:
             (kb_id,),
         ).fetchone()
     if latest is None or str(latest["status"]) != "running":
+        if os.getenv('KB_RUNTIME') == 'container':
+            from kb_runtime.queue import cancel_graph
+            if cancel_graph(kb_id):
+                with db.connect(cfg.state_db) as con:
+                    discovery.set_config(con, kb_id, {'graph_paused': True})
+                return {'stopped': True, 'paused': True}
         raise ValueError("No graph build is running")
     result = stop_graph_build_now(cfg, kb_id=kb_id, reason="Build stopped by “Pause build”")
     if not result.get("stopped"):
@@ -1528,6 +1594,9 @@ def pause_graph_build(kb_id: str) -> dict[str, Any]:
     # so the auto-rebuild side honours it first.
     with db.connect(cfg.state_db) as con:
         discovery.set_config(con, kb_id, {"graph_paused": True})
+    if os.getenv('KB_RUNTIME') == 'container':
+        from kb_runtime.queue import cancel_graph
+        cancel_graph(kb_id)
     result["cache_entries"] = graph_cache_entries(cfg, str(row["collection"]))
     return result
 
@@ -1545,6 +1614,10 @@ def _graph_action_gate(con, cfg: Settings, kb_id: str):
     exists, this KB is not being parsed, the graph is on, the models are all set and no build is running.
     Returns (kb_sources row, config, most recent build record)."""
     db.reconcile_stale_graph_builds(con)   # a dead record must not block rebuilding forever
+    if os.getenv('KB_RUNTIME') == 'container':
+        from kb_runtime.queue import active_graph
+        if active_graph():
+            raise ValueError('A graph build is already running')
     row = con.execute("SELECT * FROM kb_sources WHERE kb_id=?", (kb_id,)).fetchone()
     if row is None:
         raise KeyError(kb_id)
@@ -1621,19 +1694,26 @@ def trigger_graph_append(kb_id: str) -> dict[str, Any]:
     return {**spawned, "base_version": decision.get("base_version"), "delta": decision.get("delta")}
 
 
-def trigger_graph_build(kb_id: str) -> dict[str, Any]:
-    """The "Save and build now" action: after validation, start one graph build for this knowledge base as a
-    background process; progress checks in through graph_builds.stage and is visible live on the
-    "Graph build status" panel."""
+def trigger_graph_build(kb_id: str, *, mode: str = "build") -> dict[str, Any]:
+    """Run starts/resumes a build or appends to a completed graph; rebuild starts a full new version.
+
+    The default preserves the existing API's build/resume behavior.
+    """
+    if mode not in ("build", "run", "rebuild"):
+        raise ValueError("Unknown graph build mode")
     cfg = settings()
     with db.connect(cfg.state_db) as con:
         _row, _config, latest = _graph_action_gate(con, cfg, kb_id)
+        halted = latest is not None and str(latest["status"]) in ("cancelled", "failed")
+        run_new = mode == "run" and not halted
         # Last build stopped midway (paused / failed), config and corpus unchanged, and some phases really
         # completed: resume the same version and skip the completed phases. Otherwise start a new version
         # from scratch.
         resume_version = None
         resume_append = False
-        if latest is not None and str(latest["status"]) in ("cancelled", "failed"):
+        if mode != "rebuild" and halted:
+            if mode == "run" and not _paused_cache_reuse(con, kb_id, latest)["cache_reusable"]:
+                raise ValueError("The previous build cannot be resumed; use Rebuild all")
             kind = str(latest["build_kind"] or "full") if "build_kind" in latest.keys() else "full"
             if kind == "append" and db.latest_successful_graph_build(con, kb_id) is not None:
                 # What stopped midway was an append: carrying on means appending once more. Resuming the same
@@ -1648,6 +1728,19 @@ def trigger_graph_build(kb_id: str) -> dict[str, Any]:
         # -- otherwise once this run finishes, the auto-rebuild side still treats the KB as paused.
         if discovery.get_config(con, kb_id).get("graph_paused"):
             discovery.set_config(con, kb_id, {"graph_paused": None})
+    if run_new:
+        source = discovery.build_source(cfg.mirror_root, str(_row["source_root"]),
+                                        {**_config, "graph_paused": False}, kb_id=kb_id,
+                                        collection=str(_row["collection"]))
+        decision = _graph_run_decision(cfg, kb_id, source)
+        if decision["kind"] == "build":
+            return _spawn_graph_build(cfg, kb_id)
+        if decision["kind"] == "append":
+            return trigger_graph_append(kb_id)
+        reason = decision.get("reason", "source_unchanged")
+        if reason in ("source_unchanged", "no_active_content"):
+            return {"started": False, "reason": reason}
+        raise ValueError(APPEND_SKIP.get(reason, f"Cannot append right now ({reason})"))
     if resume_append:
         return _spawn_graph_build(cfg, kb_id, append=True, force=True)
     return _spawn_graph_build(cfg, kb_id, graph_version=resume_version)
@@ -1786,13 +1879,11 @@ def file_chunks(kb_id: str, file_id: str, limit: int = PREVIEW_CHUNK_LIMIT) -> d
     refs = refs[:limit]
     items: list[dict[str, Any]] = []
     if refs:
-        q = qdrant_client(cfg.qdrant_url, cfg.qdrant_api_key)
+        store = get_storage(cfg)
         collection = str(row["collection"])
         payloads: dict[str, dict[str, Any]] = {}
         ids = [str(r["point_id"]) for r in refs]
-        for i in range(0, len(ids), 200):
-            for p in q.retrieve(collection_name=collection, ids=ids[i:i + 200], with_payload=True, with_vectors=False):
-                payloads[str(p.id)] = dict(p.payload or {})
+        payloads = store.chunks.payloads(collection, ids, active_only=False)
         for r in refs:
             pl = payloads.get(str(r["point_id"]), {})
             items.append({
@@ -2210,12 +2301,22 @@ def retry_file(file_id: str) -> dict[str, Any]:
 
 # ── LLM registry ────────────────────────────────────────────────────────
 
+def reveal_llm_key(name: str) -> dict[str, str]:
+    with db.connect(settings().state_db) as con:
+        row = db.get_llm(con, name)
+        if row is None:
+            raise KeyError(name)
+        return {"api_key": str(row["api_key"] or "")}
+
+
 def _mask(row) -> dict[str, Any]:
     return {
         "name": str(row["name"]),
         "base_url": str(row["base_url"]),
         "model_id": str(row["model_id"]),
         "max_input_tokens": row["max_input_tokens"] if "max_input_tokens" in row.keys() else None,
+        "multimodal": bool(row["multimodal"]),
+        "concurrency": int(row["concurrency"]),
         "has_api_key": bool(str(row["api_key"] or "")),
         "protocol": str(row["protocol"] if "protocol" in row.keys() else "openai") or "openai",
     }
@@ -2275,16 +2376,22 @@ def _endpoint_id(url: str) -> tuple[str, str, int | None]:
         return ("", url.strip(), None)
 
 
-def _probe_llm(base_url: str, api_key: str, model_id: str, protocol: str = "openai") -> None:
-    """Connectivity test before saving: ask the model to reply with OK only; a reply containing ok
-    (case-insensitive) passes; any network / protocol / content problem raises ValueError and the save is
-    refused."""
+def _probe_llm(base_url: str, api_key: str, model_id: str, protocol: str = "openai", *, multimodal: bool = False) -> None:
+    """Check text or image input before saving; image replies need no fixed wording."""
+    content: Any = "Connectivity test: reply with OK only"
+    if multimodal:
+        from .model_endpoints import _test_image
+        image_url = _test_image()
+        image = ({"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                  "data": image_url.split(",", 1)[1]}} if protocol == "anthropic" else
+                 {"type": "image_url", "image_url": {"url": image_url}})
+        content = [{"type": "text", "text": "Briefly describe the attached image."}, image]
     base = base_url.rstrip("/")
     headers = {"Content-Type": "application/json"}
     body: dict[str, Any] = {
         "model": model_id,
-        "messages": [{"role": "user", "content": "Connectivity test: reply with OK only"}],
-        # Reasoning tokens may share this budget; the probe still asks for only OK.
+        "messages": [{"role": "user", "content": content}],
+        # Reasoning tokens may share the budget with the short probe reply.
         **generation_parameters(model_id, protocol=protocol, base_url=base, max_tokens=4096),
     }
     url = endpoint_url(base, protocol)
@@ -2316,11 +2423,20 @@ def _probe_llm(base_url: str, api_key: str, model_id: str, protocol: str = "open
             finish = data.get("stop_reason")
         else:
             choice = resp.json()["choices"][0]
-            content = str(choice["message"]["content"] or "")
+            raw_content = choice["message"]["content"]
+            content = str(raw_content or "")
+            if multimodal:
+                if isinstance(raw_content, list):
+                    raw_content = "".join(b["text"] for b in raw_content
+                                          if isinstance(b, dict) and b.get("type") == "text"
+                                          and isinstance(b.get("text"), str))
+                content = raw_content if isinstance(raw_content, str) else ""
             finish = choice.get("finish_reason")
     except Exception:
         raise ValueError("Connectivity test failed: the response is not a valid chat format for the selected protocol")
-    if not re.search(r"\bok\b", content, re.IGNORECASE):
+    if multimodal and not content.strip():
+        raise ValueError("Image connection test failed: no text response returned")
+    if not multimodal and not re.search(r"\bok\b", content, re.IGNORECASE):
         raise ValueError(f"Connectivity test did not pass: the model replied “{content.strip()[:60]}”, which does not contain OK")
     if finish in ("length", "max_tokens", "content_filter", "insufficient_system_resource", "aborted"):
         raise ValueError(f"Connectivity test did not pass: the response did not complete ({finish})")
@@ -2345,6 +2461,17 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
     with db.connect(cfg.state_db) as con:
         existing = db.get_llm(con, name)
     stored_key = str(existing["api_key"] or "") if existing is not None else ""
+    multimodal = payload.get("multimodal", bool(existing["multimodal"]) if existing is not None else False)
+    concurrency = payload.get("concurrency", int(existing["concurrency"]) if existing is not None else 1)
+    if not isinstance(multimodal, bool):
+        raise ValueError("Multimodal must be a boolean")
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 256:
+        raise ValueError("Concurrency must be an integer from 1 to 256")
+    if not multimodal and existing is not None:
+        with db.connect(cfg.state_db) as con:
+            if any(discovery.get_config(con, str(row["kb_id"])).get("vlm_model") == name
+                   for row in discovery.known_sources(con)):
+                raise ValueError("This model is selected for image descriptions; select another model before disabling multimodal")
     # Old API clients may omit the new field. Preserve it only for the same
     # model/endpoint; a capacity belonging to another model must not follow it.
     max_input = payload.get("max_input_tokens")
@@ -2367,7 +2494,7 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("The endpoint or protocol changed; enter the API key again, or tick \"clear key\" for endpoints that need none")
     # The probe waits for the other end to answer, up to tens of seconds: it runs outside the write transaction
     # so it does not hold the state database's write lock while parse and graph build writes wait
-    _probe_llm(base_url, "" if clear_key else (api_key or stored_key), model_id, protocol)
+    _probe_llm(base_url, "" if clear_key else (api_key or stored_key), model_id, protocol, multimodal=multimodal)
     with db.connect(cfg.state_db) as con:
         if protocol != "openai":
             for row in discovery.known_sources(con):
@@ -2381,6 +2508,8 @@ def save_llm(payload: dict[str, Any]) -> dict[str, Any]:
             model_id=model_id,
             protocol=protocol,
             max_input_tokens=max_input,
+            multimodal=multimodal,
+            concurrency=concurrency,
         )
         if clear_key:
             con.execute("UPDATE llm_registry SET api_key='' WHERE name=?", (name,))
@@ -2461,6 +2590,10 @@ def managed_services() -> tuple[str, ...]:
     test stubs), the default two rows apply."""
     from kb_pipeline.config import CONSOLE_SERVICES_DEFAULT
 
+    if os.getenv('KB_RUNTIME') == 'container':
+        return ()  # Container lifecycle is owned by Compose, not a Docker socket in the web app.
+    if getattr(settings(), "storage_backend", "standard") == "light":
+        return ()
     keys = getattr(settings(), "console_services", None)
     if keys is None:
         keys = CONSOLE_SERVICES_DEFAULT
@@ -2669,6 +2802,9 @@ def _probe_neo4j(uri: str, user: str, password: str | None) -> bool:
 
 def health() -> dict[str, Any]:
     cfg = settings()
+    if getattr(cfg, "storage_backend", "standard") == "light":
+        return {"storage_backend": "light", "system_services": False, "managed": [], "timers": [],
+                "qdrant": None, "opensearch": None, "neo4j": None, "mineru": None}
     # With the panel open this is polled every 5 seconds, while probing 5-6 services serially with a 4-second
     # timeout each means 20 seconds per call when several are down at once -- requests pile up and
     # out-of-order responses make the status flip back and forth. Probe concurrently and cache for 3 seconds.
@@ -2728,12 +2864,19 @@ def health() -> dict[str, Any]:
     result["mineru_backend"], result["mineru_backend_source"] = resolve_backend(getattr(cfg, "runtime_dir", None))
     result["parse_enabled"] = cfg.parse_enabled
     units = [u for _, _, u, _ in _TIMER_UNITS]
-    result["timers"] = timer_health(
-        _systemctl_show([f"{u}.service" for u in units], ["Id", "ActiveState", "SubState", "Result"]),
-        merge_timer_next(_systemctl_show([f"{u}.timer" for u in units], ["Id", "ActiveState", "NextElapseUSecRealtime", "LastTriggerUSec"]),
-                         _systemctl_list_timers()),
-        _maintenance_defers(Path(cfg.state_db).parent / "maintenance"),
-    )
+    if os.getenv("KB_RUNTIME") == "container":
+        from kb_runtime.queue import timer_rows
+        result["timers"] = timer_rows()
+        labels = {key: label for key, label, _, _ in _TIMER_UNITS}
+        for timer in result["timers"]:
+            timer["label"] = labels.get(timer["key"], timer["label"])
+    else:
+        result["timers"] = timer_health(
+            _systemctl_show([f"{u}.service" for u in units], ["Id", "ActiveState", "SubState", "Result"]),
+            merge_timer_next(_systemctl_show([f"{u}.timer" for u in units], ["Id", "ActiveState", "NextElapseUSecRealtime", "LastTriggerUSec"]),
+                             _systemctl_list_timers()),
+            _maintenance_defers(Path(cfg.state_db).parent / "maintenance"),
+        )
     _health_cache["at"] = time.time()
     _health_cache["value"] = result
     return dict(result)

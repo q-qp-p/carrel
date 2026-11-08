@@ -298,10 +298,8 @@ def record_schema_observation(con, kb_id: str, *, version_id: str, observed: dic
 def sample_docs(settings: Any, source: KBSource, *, q: Any = None, spec: Any = None) -> dict[str, Any]:
     """The sample for label extraction: active chunk ledger -> payloads -> stratified + farthest-point sampling
     (schema.sample_chunks). Returns the sample and how it was drawn."""
-    from ..vector.layout import TEXT_VECTOR
-    from ..vector.qdrant import client as qdrant_client
+    from ..storage import get_storage
     from . import schema as graph_schema
-    from .units import fetch_chunk_payloads
     from .build import tune_llm_spec
     from .sampling_budget import sampling_budget
 
@@ -311,21 +309,14 @@ def sample_docs(settings: Any, source: KBSource, *, q: Any = None, spec: Any = N
         ledger = db.active_chunk_refs(con, source.collection)
     if not ledger:
         raise ValueError("This knowledge base has no active chunks yet; finish parsing before extracting labels")
-    q = q or qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-    payloads = fetch_chunk_payloads(q, source.collection, ledger)
+    store = get_storage(settings, vector_client=q)
+    payloads = store.graph.corpus_payloads(source.collection, ledger)
     chunks = [{"doc_id": c.doc_id, "chunk_index": c.chunk_index, "chunk_uid": c.chunk_uid, "point_id": c.point_id,
                "text": c.text, "section": " > ".join(c.section_path)} for c in payloads]
 
     def fetch_vectors(pool: list[dict[str, Any]]) -> dict[str, list[float]]:
         ids = [str(c["point_id"]) for c in pool if c.get("point_id")]
-        out: dict[str, list[float]] = {}
-        for i in range(0, len(ids), 128):
-            for p in q.retrieve(collection_name=source.collection, ids=ids[i:i + 128],
-                                with_vectors=[TEXT_VECTOR], with_payload=False):
-                vec = p.vector.get(TEXT_VECTOR) if isinstance(p.vector, dict) else p.vector
-                if vec:
-                    out[str(p.id)] = list(vec)
-        return out
+        return store.chunks.vectors(source.collection, ids)
 
     sample = graph_schema.sample_chunks(chunks, 0, budget=budget["sample_token_budget"], fetch_vectors=fetch_vectors)
     return {

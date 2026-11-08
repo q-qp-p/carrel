@@ -6,8 +6,8 @@ set -euo pipefail
 # KB_LOCAL_BASE_DIR (systemd injects it, interactive shells usually do not).
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${KB_LOCAL_BASE_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
-APP_DIR="$BASE_DIR/app"
-PY="$APP_DIR/.venv/bin/python"
+APP_DIR="${KB_APP_DIR:-$BASE_DIR/app}"
+PY="${KB_PYTHON:-$APP_DIR/.venv/bin/python}"
 if [[ -n "${KB_ENV_FILE:-}" ]]; then
   ENV_FILE="$KB_ENV_FILE"
 elif [[ -f "$BASE_DIR/config/knowledge-base.env" ]]; then
@@ -174,7 +174,9 @@ set -e
 # pass the exit code through) would never be reached.
 queued_jobs="$(grep -oE 'scan summary: .*jobs=[0-9]+' "$SCAN_OUT" | grep -oE 'jobs=[0-9]+' | tail -1 | cut -d= -f2 || true)"
 rm -f "$SCAN_OUT"; SCAN_OUT=""
-if [[ "${KB_SCAN_KICK_WORKER:-1}" =~ ^(1|true|yes|on)$ && "${queued_jobs:-0}" -gt 0 ]] && command -v systemctl >/dev/null 2>&1; then
+if [[ "${KB_SCAN_KICK_WORKER:-1}" =~ ^(1|true|yes|on)$ && "${queued_jobs:-0}" -gt 0 && "${KB_RUNTIME:-}" == container ]]; then
+  "$PY" -m kb_runtime request worker
+elif [[ "${KB_SCAN_KICK_WORKER:-1}" =~ ^(1|true|yes|on)$ && "${queued_jobs:-0}" -gt 0 ]] && command -v systemctl >/dev/null 2>&1; then
   if systemctl --user start --no-block carrel-worker.service >/dev/null 2>&1; then
     echo "=== $(ts) KB scan queued ${queued_jobs} job(s); worker kicked ==="
   else

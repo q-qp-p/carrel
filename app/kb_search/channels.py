@@ -70,7 +70,7 @@ def embed_question(settings: Settings, question: str, *, timeout: float = 10.0, 
     client = EmbeddingClient(base_url=settings.embedding_base_url, api_key=settings.embedding_api_key,
                              model_id=settings.embedding_model_id, dim=settings.embedding_dim, batch_size=1, retry=1, sleep_seconds=0)
     resp = client.client.embeddings.create(model=settings.embedding_model_id, input=[query_text(question, instruction)],
-                                           dimensions=int(settings.embedding_dim), timeout=float(timeout))
+                                           dimensions=int(settings.embedding_dim), timeout=float(timeout), **client.request_options)
     vec = [float(x) for x in resp.data[0].embedding]
     if len(vec) != int(settings.embedding_dim):
         raise RuntimeError(f"embedding dim mismatch: {len(vec)}")
@@ -282,7 +282,7 @@ def shared_driver(settings: Settings) -> Any:
 def graph_channel(settings: Settings, source: KBSource, question: str, *, limit: int, hops: int,
                   vector: list[float] | None = None, lexical_only: bool = False, q: Any = None,
                   timeout: float | None = None, history: bool = False, as_of: str | None = None,
-                  include_chunks: bool = True) -> dict[str, Any]:
+                  include_chunks: bool = True, native: Any = None) -> dict[str, Any]:
     """图路作候选扩展(Q04):调 graph_query,只取切片 id 与图分作特征;实体 / 关系 / 事实 / 页面另外带回来给证据表。
     任何失败(别名版本不一致、Neo4j 不可达、图集合不存在)都只跳过图路,整次查询照常。
     vector:问题向量已经算过就传进来(省一次嵌入);lexical_only:嵌入服务挂了,只用词法种子(Q19)。
@@ -293,7 +293,7 @@ def graph_channel(settings: Settings, source: KBSource, question: str, *, limit:
 
     try:
         res = graph_query(settings, source, question, hops=int(hops), chunk_limit=int(limit), candidate_limit=int(limit),
-                          with_text=True, vector=vector, lexical_only=lexical_only, q=q, driver=shared_driver(settings),
+                          with_text=True, vector=vector, lexical_only=lexical_only, q=q, driver=shared_driver(settings) if native is None else None, native=native,
                           timeout=timeout, history=history, as_of=as_of, include_chunks=include_chunks)
     except Exception as exc:
         return {"chunks": [], "skipped": f"{type(exc).__name__}: {str(exc)[:160]}"}

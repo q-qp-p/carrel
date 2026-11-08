@@ -1,14 +1,4 @@
-# Carrel infrastructure: the parser (MinerU), the three stores (Qdrant,
-# OpenSearch, Neo4j) and, behind the `local-models` profile, four vLLM model
-# servers for people who want text and visual embeddings / rerankers on the
-# same box instead of a hosted API.
-#
-# Every host path below is relative to this directory, so data lands under
-# <repo>/runtime and weights under <repo>/models wherever the repo is checked
-# out. `deploy.sh` at the repo root writes the `.env` next to this file
-# (GPU or CPU, registry mirror, memory tier, Neo4j password); run it instead of
-# editing defaults here. `compose.gpu.yml` adds the GPU reservation for MinerU
-# and is included through COMPOSE_FILE in that `.env`.
+# Carrel application + MinerU; enable the standard profile for database services.
 name: carrel
 
 # json-file has no size limit by default and a log is only cleared when its
@@ -19,262 +9,55 @@ x-logging: &default-logging
     max-size: "50m"
     max-file: "3"
 
-x-vllm-environment: &vllm-environment
-  VLLM_USE_DEEP_GEMM: "${VLLM_USE_DEEP_GEMM:-0}"
-
-# The three servers a search calls (embedding, reranker, vl-embedding) run in
-# vLLM's batch-invariant mode: the same input gives bit-identical vectors and
-# scores however requests are batched and whether the prefix cache hits, so the
-# same search ranks the same way every time. Without it identical requests got
-# slightly different scores and the chunks near the cut-off came and went.
-# Image embedding is somewhat slower in this mode; the parser keeps the default.
-x-vllm-deterministic: &vllm-deterministic
-  <<: *vllm-environment
-  VLLM_BATCH_INVARIANT: "${VLLM_BATCH_INVARIANT:-1}"
-
-# The model servers start one after another. Started together, every vLLM
-# process profiles the free GPU memory while the others are still loading or
-# freeing theirs, fails its memory check and restarts until Docker's backoff
-# happens to separate them (one to eight restarts per server on a unified-
-# memory machine, a quarter of an hour until all were up). So each server
-# waits for the previous one's /health before it loads its model
-# (WAIT_FOR_URL, set per service below). depends_on only orders
-# `docker compose up`; the wait inside the container also covers Docker
-# restoring the containers at boot. The NVIDIA image's own entrypoint is kept
-# when present, and the `vllm serve ...` command of each service runs as
-# written under either image.
-x-vllm-entrypoint: &vllm-entrypoint
-  - bash
-  - -c
-  - |
-    if [ -n "$$WAIT_FOR_URL" ]; then
-      until curl -fsS "$$WAIT_FOR_URL" >/dev/null 2>&1; do sleep 5; done
-    fi
-    if [ -x /opt/nvidia/nvidia_entrypoint.sh ]; then exec /opt/nvidia/nvidia_entrypoint.sh "$$@"; fi
-    exec "$$@"
-  - vllm-wait
-
-x-vllm-common: &vllm-common
-  image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.21.0}
-  restart: unless-stopped
-  ipc: host
-  gpus: all
-  profiles: ["local-models"]
-  logging: *default-logging
-  entrypoint: *vllm-entrypoint
-  environment: *vllm-environment
-  networks:
-    - carrel
-
-x-vllm-healthcheck: &vllm-healthcheck
-  test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
-  interval: 30s
-  timeout: 5s
-  retries: 5
-  # The last server in the queue starts loading only once the ones before it
-  # are up; a container that is still waiting shows "health: starting".
-  start_period: 900s
-
 services:
-  # ── optional local model servers (profile: local-models) ─────────────────
-  embedding:
-    <<: *vllm-common
-    container_name: carrel-embedding
-    environment: *vllm-deterministic
-    ports:
-      - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_EMBEDDING_PORT:-8101}:8000"
-    volumes:
-      - "${QWEN3_EMBEDDING_MODEL_PATH:-../../models/Qwen3-Embedding-0.6B}:/models/Qwen3-Embedding-0.6B:ro"
-    command:
-      - vllm
-      - serve
-      - /models/Qwen3-Embedding-0.6B
-      - --served-model-name
-      - qwen3-embedding-0.6b
-      - --runner
-      - pooling
-      - --convert
-      - embed
-      - --hf-overrides
-      - '{"is_matryoshka":true}'
-      - --dtype
-      - "${QWEN3_EMBEDDING_DTYPE:-bfloat16}"
-      - --gpu-memory-utilization
-      - "${QWEN3_EMBEDDING_GPU_MEMORY_UTILIZATION:-0.10}"
-      - --max-model-len
-      - "${QWEN3_EMBEDDING_MAX_MODEL_LEN:-8192}"
-      - --max-num-seqs
-      - "${QWEN3_EMBEDDING_MAX_NUM_SEQS:-32}"
-      - --max-num-batched-tokens
-      - "${QWEN3_EMBEDDING_MAX_NUM_BATCHED_TOKENS:-49152}"
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-    healthcheck: *vllm-healthcheck
-
-  reranker:
-    <<: *vllm-common
-    container_name: carrel-reranker
+  app:
+    image: ${CARREL_IMAGE:-carrel-app:local}
+    build:
+      context: ../..
+      dockerfile: deployment/compose/app/Dockerfile
+      args:
+        PYTHON_IMAGE: ${CARREL_PYTHON_IMAGE:-python:3.12-slim}
+        DEBIAN_MIRROR: ${DEBIAN_MIRROR:-http://deb.debian.org}
+        WITH_PDF_IMAGES: ${WITH_PDF_IMAGES:-0}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    hostname: ${COMPOSE_PROJECT_NAME:-carrel}-app
+    init: true
+    restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: 60s
     environment:
-      <<: *vllm-deterministic
-      WAIT_FOR_URL: http://embedding:8000/health
-    depends_on:
-      embedding:
-        condition: service_healthy
-    ports:
-      - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_RERANKER_PORT:-8102}:8000"
+      KB_STORAGE_BACKEND: ${CARREL_EDITION:-standard}
+      KB_WEB_HOST: 0.0.0.0
+      KB_SEARCH_HOST: 0.0.0.0
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-CHANGE_ME}
+      TZ: ${TZ:-UTC}
     volumes:
-      - "${QWEN3_RERANKER_MODEL_PATH:-../../models/Qwen3-Reranker-0.6B}:/models/Qwen3-Reranker-0.6B:ro"
-      - "${QWEN3_RERANKER_TEMPLATE_PATH:-./assets/qwen3_reranker.jinja}:/templates/qwen3_reranker.jinja:ro"
-    command:
-      - vllm
-      - serve
-      - /models/Qwen3-Reranker-0.6B
-      - --served-model-name
-      - qwen3-reranker-0.6b
-      - --runner
-      - pooling
-      - --hf-overrides
-      - '{"architectures":["Qwen3ForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}'
-      - --chat-template
-      - /templates/qwen3_reranker.jinja
-      - --dtype
-      - "${QWEN3_RERANKER_DTYPE:-bfloat16}"
-      - --gpu-memory-utilization
-      - "${QWEN3_RERANKER_GPU_MEMORY_UTILIZATION:-0.10}"
-      - --max-model-len
-      - "${QWEN3_RERANKER_MAX_MODEL_LEN:-12288}"
-      - --max-num-seqs
-      - "${QWEN3_RERANKER_MAX_NUM_SEQS:-16}"
-      - --max-num-batched-tokens
-      - "${QWEN3_RERANKER_MAX_NUM_BATCHED_TOKENS:-49152}"
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-    healthcheck: *vllm-healthcheck
-
-  vl-embedding:
-    <<: *vllm-common
-    container_name: carrel-vl-embedding
-    environment:
-      <<: *vllm-deterministic
-      WAIT_FOR_URL: http://reranker:8000/health
-    depends_on:
-      reranker:
-        condition: service_healthy
+      - "${CARREL_DATA_PATH:-../../data}:/data:rw"
+      - "${MINERU_OUTPUT_PATH:-../../runtime/mineru-output}:/data/runtime/mineru-output:rw"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_VL_EMBEDDING_PORT:-8103}:8000"
-    volumes:
-      - "${QWEN3_VL_EMBEDDING_MODEL_PATH:-../../models/Qwen3-VL-Embedding-2B}:/models/Qwen3-VL-Embedding-2B:ro"
-    command:
-      - vllm
-      - serve
-      - /models/Qwen3-VL-Embedding-2B
-      - --served-model-name
-      - qwen3-vl-embedding-2b
-      - --runner
-      - pooling
-      - --convert
-      - embed
-      - --hf-overrides
-      - '{"is_matryoshka":true}'
-      - --dtype
-      - "${QWEN3_VL_EMBEDDING_DTYPE:-bfloat16}"
-      - --gpu-memory-utilization
-      - "${QWEN3_VL_EMBEDDING_GPU_MEMORY_UTILIZATION:-0.12}"
-      - --max-model-len
-      - "${QWEN3_VL_EMBEDDING_MAX_MODEL_LEN:-8192}"
-      - --max-num-seqs
-      - "${QWEN3_VL_EMBEDDING_MAX_NUM_SEQS:-6}"
-      - --max-num-batched-tokens
-      - "${QWEN3_VL_EMBEDDING_MAX_NUM_BATCHED_TOKENS:-24576}"
-      - --limit-mm-per-prompt
-      - '{"image":1,"video":1}'
-      - --mm-processor-cache-gb
-      - "${QWEN3_VL_EMBEDDING_MM_PROCESSOR_CACHE_GB:-1}"
-      - --mm-processor-kwargs
-      - '{"max_pixels":${QWEN3_VL_EMBEDDING_MAX_PIXELS:-3686400}}'
-      - --media-io-kwargs
-      - '{"video":{"num_frames":${QWEN3_VL_EMBEDDING_MAX_FRAMES:-32}}}'
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-    healthcheck: *vllm-healthcheck
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-9800}:9800"
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${SEARCH_PORT:-9810}:9810"
+    healthcheck:
+      test: ["CMD", "python", "-m", "kb_runtime", "health"]
+      interval: 15s
+      timeout: 12s
+      retries: 4
+      start_period: 30s
+    networks: [carrel]
 
-  vl-reranker:
-    <<: *vllm-common
-    container_name: carrel-vl-reranker
-    environment:
-      <<: *vllm-environment
-      WAIT_FOR_URL: http://vl-embedding:8000/health
-    depends_on:
-      vl-embedding:
-        condition: service_healthy
-    ports:
-      - "${MODEL_BIND_ADDRESS:-127.0.0.1}:${QWEN3_VL_RERANKER_PORT:-8104}:8000"
-    volumes:
-      - "${QWEN3_VL_RERANKER_MODEL_PATH:-../../models/Qwen3-VL-Reranker-2B}:/models/Qwen3-VL-Reranker-2B:ro"
-      - "${QWEN3_VL_RERANKER_TEMPLATE_PATH:-./assets/qwen3_vl_reranker.jinja}:/templates/qwen3_vl_reranker.jinja:ro"
-    command:
-      - vllm
-      - serve
-      - /models/Qwen3-VL-Reranker-2B
-      - --served-model-name
-      - qwen3-vl-reranker-2b
-      - --runner
-      - pooling
-      - --trust-remote-code
-      - --hf-overrides
-      - '{"architectures":["Qwen3VLForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}'
-      - --chat-template
-      - /templates/qwen3_vl_reranker.jinja
-      - --dtype
-      - "${QWEN3_VL_RERANKER_DTYPE:-bfloat16}"
-      - --gpu-memory-utilization
-      - "${QWEN3_VL_RERANKER_GPU_MEMORY_UTILIZATION:-0.15}"
-      - --max-model-len
-      - "${QWEN3_VL_RERANKER_MAX_MODEL_LEN:-12288}"
-      - --max-num-seqs
-      - "${QWEN3_VL_RERANKER_MAX_NUM_SEQS:-6}"
-      - --max-num-batched-tokens
-      - "${QWEN3_VL_RERANKER_MAX_NUM_BATCHED_TOKENS:-36864}"
-      - --limit-mm-per-prompt
-      - '{"image":2,"video":1}'
-      - --mm-processor-cache-gb
-      - "${QWEN3_VL_RERANKER_MM_PROCESSOR_CACHE_GB:-1}"
-      - --mm-processor-kwargs
-      - '{"max_pixels":${QWEN3_VL_RERANKER_MAX_PIXELS:-3686400}}'
-      - --media-io-kwargs
-      - '{"video":{"num_frames":${QWEN3_VL_RERANKER_MAX_FRAMES:-32}}}'
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8000"
-    healthcheck: *vllm-healthcheck
-
-  # ── parser ────────────────────────────────────────────────────────────────
-  # Built from ./mineru. The entrypoint looks at the GPU it actually got,
-  # picks the backend (vlm-engine on a capable GPU, pipeline otherwise or when
-  # MINERU_BACKEND_POLICY says so), downloads the matching weights into
-  # /models on first start and publishes its decision to /data/output/
-  # carrel-mineru.json, which the pipeline reads when MINERU_BACKEND=auto.
-  # With the local-models profile it loads its own model only after the last
-  # model server is up (MINERU_WAIT_FOR_URL, written by deploy.sh); a service
-  # outside the profile cannot depend_on one inside it, hence the variable.
   mineru:
-    image: carrel-mineru:${MINERU_VERSION:-3.4.4}-${MINERU_FLAVOR:-gpu}
+    image: carrel-mineru:${MINERU_VERSION:-3.4.4}-${MINERU_FLAVOR:-cpu}
     build:
       context: ./mineru
       args:
-        FLAVOR: ${MINERU_FLAVOR:-gpu}
-        BASE_IMAGE: ${MINERU_BASE_IMAGE:-vllm/vllm-openai:v0.21.0}
+        FLAVOR: ${MINERU_FLAVOR:-cpu}
+        BASE_IMAGE: ${MINERU_BASE_IMAGE:-python:3.12-slim}
         MINERU_VERSION: ${MINERU_VERSION:-3.4.4}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
         TORCH_CPU_INDEX_URL: ${TORCH_CPU_INDEX_URL:-https://download.pytorch.org/whl/cpu}
-    container_name: carrel-mineru
+    container_name: ${COMPOSE_PROJECT_NAME:-carrel}-mineru
     restart: unless-stopped
     ipc: host
     logging: *default-logging
@@ -321,8 +104,9 @@ services:
 
   # ── stores ────────────────────────────────────────────────────────────────
   qdrant:
+    profiles: ["standard"]
     image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.18.2}
-    container_name: carrel-qdrant
+    container_name: ${COMPOSE_PROJECT_NAME:-carrel}-qdrant
     restart: unless-stopped
     logging: *default-logging
     ports:
@@ -336,7 +120,7 @@ services:
       # write across origins. Only backend clients use it, so it is off.
       QDRANT__SERVICE__ENABLE_CORS: "false"
     volumes:
-      - "${QDRANT_DATA_PATH:-../../runtime/qdrant_data}:/qdrant/storage:rw"
+      - "qdrant-data:/qdrant/storage:rw"
     mem_limit: "${QDRANT_MEM_LIMIT:-4g}"
     mem_reservation: "${QDRANT_MEM_RESERVATION:-1g}"
     stop_grace_period: 30s
@@ -354,15 +138,16 @@ services:
       - carrel
 
   neo4j:
+    profiles: ["standard"]
     image: ${NEO4J_IMAGE:-neo4j:5.26.28-community}
-    container_name: carrel-neo4j
+    container_name: ${COMPOSE_PROJECT_NAME:-carrel}-neo4j
     restart: unless-stopped
     logging: *default-logging
     ports:
       - "${NEO4J_BIND_ADDRESS:-127.0.0.1}:${NEO4J_HTTP_PORT:-7474}:7474"
       - "${NEO4J_BIND_ADDRESS:-127.0.0.1}:${NEO4J_BOLT_PORT:-7687}:7687"
     environment:
-      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .env (deploy.sh generates one)}"
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-CHANGE_ME}"
       NEO4J_server_memory_heap_initial__size: "${NEO4J_HEAP_INITIAL_SIZE:-512m}"
       NEO4J_server_memory_heap_max__size: "${NEO4J_HEAP_MAX_SIZE:-2G}"
       NEO4J_server_memory_pagecache_size: "${NEO4J_PAGECACHE_SIZE:-1G}"
@@ -372,10 +157,10 @@ services:
       # "2 days 2G" fills up to 2 GB after every large graph-version delete.
       NEO4J_db_tx__log_rotation_retention__policy: "1 files"
     volumes:
-      - "${NEO4J_DATA_PATH:-../../runtime/neo4j/data}:/data:rw"
-      - "${NEO4J_LOGS_PATH:-../../runtime/neo4j/logs}:/logs:rw"
-      - "${NEO4J_PLUGINS_PATH:-../../runtime/neo4j/plugins}:/plugins:rw"
-      - "${NEO4J_IMPORT_PATH:-../../runtime/neo4j/import}:/var/lib/neo4j/import:rw"
+      - "neo4j-data:/data:rw"
+      - "neo4j-logs:/logs:rw"
+      - "neo4j-plugins:/plugins:rw"
+      - "neo4j-import:/var/lib/neo4j/import:rw"
     mem_limit: "${NEO4J_MEM_LIMIT:-4g}"
     mem_reservation: "${NEO4J_MEM_RESERVATION:-1g}"
     stop_grace_period: 60s
@@ -389,8 +174,9 @@ services:
       - carrel
 
   opensearch:
+    profiles: ["standard"]
     image: ${OPENSEARCH_IMAGE:-opensearchproject/opensearch:3.7.0}
-    container_name: carrel-opensearch
+    container_name: ${COMPOSE_PROJECT_NAME:-carrel}-opensearch
     restart: unless-stopped
     logging: *default-logging
     ports:
@@ -416,7 +202,7 @@ services:
       OPENSEARCH_JAVA_OPTS: "-Xms${OPENSEARCH_JAVA_HEAP:-1g} -Xmx${OPENSEARCH_JAVA_HEAP:-1g}"
       TZ: "${TZ:-UTC}"
     volumes:
-      - "${OPENSEARCH_DATA_PATH:-../../runtime/opensearch/data}:/usr/share/opensearch/data:rw"
+      - "opensearch-data:/usr/share/opensearch/data:rw"
     mem_limit: "${OPENSEARCH_MEM_LIMIT:-3g}"
     mem_reservation: "${OPENSEARCH_MEM_RESERVATION:-1g}"
     ulimits:
@@ -443,5 +229,12 @@ services:
 
 networks:
   carrel:
-    name: carrel
     driver: bridge
+
+volumes:
+  qdrant-data:
+  opensearch-data:
+  neo4j-data:
+  neo4j-logs:
+  neo4j-plugins:
+  neo4j-import:

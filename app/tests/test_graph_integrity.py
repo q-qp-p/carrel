@@ -377,7 +377,7 @@ def test_incremental_build_end_to_end_cache_delete_rename_resume_and_publish(tmp
         if live["fail"]:raise RuntimeError("synthetic activation failure")
         live["version"]=graph_version;return {"active":graph_version}
     monkeypatch.setenv("KB_GRAPH_VIEWS_NO_NARRATE","1")
-    monkeypatch.setattr(gb,"qdrant_client",lambda *a,**kw:q)
+    monkeypatch.setattr("kb_pipeline.storage.standard.vector_client",lambda *a,**kw:q)
     monkeypatch.setattr(db,"active_chunk_refs",lambda *a,**kw:list(refs))
     monkeypatch.setattr(gu,"fetch_chunk_payloads",lambda *a,**kw:list(corpus))
     monkeypatch.setattr(gb,"GraphExtractor",Extractor)

@@ -12,7 +12,7 @@ import sqlite3
 
 from .. import db
 from ..parse_cache import refresh_scope
-from .. import search_fts
+from ..storage import get_storage
 from ..chunking.chunker import blocks_to_chunks, embedding_context_for, embedding_input
 from ..chunking.diagnose import chunk_diagnostics, summarize_line
 from ..config import Settings
@@ -35,10 +35,6 @@ from ..parsers.table_check import table_ambiguity_summary
 from ..parsers.visual_blocks import vlm_failure_summary, went_through_vlm
 from ..utils import count_tokens, detect_lang, dir_ancestors_from_rel_path, infer_doc_type, sha256_file
 from ..vector.layout import TEXT_VECTOR, VISUAL_VECTOR
-from ..vector.qdrant import client as qdrant_client
-from ..vector.qdrant import collection_exists, ensure_collection
-from ..vector.qdrant import mark_old_versions_inactive, mark_stale_file_points_inactive, upsert_chunks
-from ..vector.qdrant import validate_collection_layout
 from ..vision.images import IMAGE_SUFFIXES
 from ..vision.vlm import compose_prompt, prompt_with_language
 
@@ -322,6 +318,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
         model_id=settings.embedding_model_id,
         dim=settings.embedding_dim,
         batch_size=settings.embedding_batch,
+        concurrency=getattr(settings, "embedding_concurrency", 1),
         retry=settings.embedding_retry,
         sleep_seconds=settings.embedding_sleep_seconds,
     )
@@ -360,7 +357,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
             vector[VISUAL_VECTOR] = visual
         named_vectors.append(vector)
 
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    store = get_storage(settings)
     point_ids = [_point_id(chunk.chunk_uid) for chunk in chunks]
     # The file row is gone = this KB (or this file) was deleted mid-parse. This used to fall back to the old
     # in-memory row and keep writing, and when the collection was already dropped, ensure_collection
@@ -399,11 +396,11 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
         )
     stage("Writing vectors", force=True)
     collection = str(write_row["collection"])
-    if not collection_exists(q, collection):
+    if not store.chunks.exists(collection):
         print(f"[qdrant] collection missing; creating collection={collection}", flush=True)
-        print(ensure_collection(q, collection, settings.vector_layout), flush=True)
+        print(store.chunks.ensure(collection, settings.vector_layout), flush=True)
     else:
-        validate_collection_layout(q, collection, settings.vector_layout)
+        store.chunks.validate(collection, settings.vector_layout)
 
     payloads = [
         _payload_for_chunk(
@@ -420,23 +417,20 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
     # vector store, old chunks in the state database", which a re-parse of the same version does not heal
     # because the scan judges the file unchanged.
     committed[0] = True
-    upsert_chunks(
-        q,
+    store.chunks.write(
         collection,
         point_ids,
         named_vectors,
         payloads,
         max_bytes=settings.qdrant_upsert_max_bytes,
     )
-    mark_old_versions_inactive(
-        q,
+    store.chunks.retire_previous(
         collection,
         kb_id=str(write_row["kb_id"]),
         file_key=int(write_row["file_key"]),
         active_content_version=content_version,
     )
-    stale_points = mark_stale_file_points_inactive(
-        q,
+    stale_points = store.chunks.retire_stale(
         collection,
         kb_id=str(write_row["kb_id"]),
         file_key=int(write_row["file_key"]),
@@ -452,9 +446,7 @@ def _parse_and_index(con: sqlite3.Connection, settings: Settings, job: sqlite3.R
     # MinerU + embedding 5 times and still leave the "Qdrant has the new version, SQLite records the old one"
     # inconsistency. Degrade to one failures record + a separate (idempotent) fts_sync job.
     try:
-        fts_result = search_fts.sync_doc_from_qdrant(
-            url=settings.opensearch_url,
-            qdrant=q,
+        fts_result = store.keywords.sync_document(
             collection=collection,
             doc_id=f"{write_row['kb_id']}:{write_row['file_key']}",
         )
@@ -534,6 +526,7 @@ def _embed_visual_chunks(settings: Settings, chunks: list[UnifiedChunk], cache_d
         dim=settings.visual_embedding_dim,
         instruction=settings.visual_embedding_instruction,
         concurrency=settings.visual_embedding_concurrency,
+        batch_size=getattr(settings, "visual_embedding_batch", 1),
         retry=settings.visual_embedding_retry,
         timeout=settings.visual_embedding_timeout_seconds,
         max_pixels=settings.image_max_pixels,
@@ -648,21 +641,18 @@ def _finish_empty_document(
         if not git_lfs_pointer(write_path) or sha256_file(write_path) != content_version:
             return _changed_skip(con, job, write_row, "source restored since validation", when="write")
 
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    store = get_storage(settings)
     collection = str(write_row["collection"])
     stale_points = 0
-    if collection_exists(q, collection):
-        stale_points = mark_stale_file_points_inactive(
-            q,
+    if store.chunks.exists(collection):
+        stale_points = store.chunks.retire_stale(
             collection,
             kb_id=str(write_row["kb_id"]),
             file_key=int(write_row["file_key"]),
             active_chunk_uids=set(),
         )
     try:
-        fts_result = search_fts.sync_doc_from_qdrant(
-            url=settings.opensearch_url,
-            qdrant=q,
+        fts_result = store.keywords.sync_document(
             collection=collection,
             doc_id=f"{write_row['kb_id']}:{write_row['file_key']}",
         )
@@ -714,7 +704,7 @@ def vlm_progress_callback(stage_cb, model_id=None):
     return cb
 
 
-def _vlm_endpoint(settings: Settings, source: KBSource) -> tuple[str, str, str]:
+def _vlm_endpoint(settings: Settings, source: KBSource) -> tuple[str, str, str, int]:
     """Resolve once per document so all visual stages share the same model and credentials."""
     name = getattr(source, "vlm_model", None)
     if not name:
@@ -725,7 +715,9 @@ def _vlm_endpoint(settings: Settings, source: KBSource) -> tuple[str, str, str]:
         raise NonRetryableParseError(f"Multimodal model {name!r} is not in the registry")
     if str(row["protocol"] or "openai") != "openai":
         raise NonRetryableParseError("Multimodal models require the OpenAI-compatible protocol")
-    return str(row["base_url"]), str(row["api_key"] or ""), str(row["model_id"])
+    if not row["multimodal"]:
+        raise NonRetryableParseError("Selected model is not marked as multimodal")
+    return str(row["base_url"]), str(row["api_key"] or ""), str(row["model_id"]), int(row["concurrency"])
 
 
 def _parse_blocks(
@@ -745,7 +737,7 @@ def _parse_blocks(
     require_source_content(path)
     # Text-only routes do not depend on the vision model registry.
     if suffix in IMAGE_SUFFIXES or suffix in {".pdf", ".docx", ".pptx", ".ipynb"}:
-        vlm_base_url, vlm_api_key, vlm_model_id = _vlm_endpoint(settings, source)
+        vlm_base_url, vlm_api_key, vlm_model_id, vlm_concurrency = _vlm_endpoint(settings, source)
     vlm_progress = vlm_progress_callback(stage_cb, locals().get("vlm_model_id"))
     vlm_options = {
         "temperature": settings.vlm_temperature,
@@ -764,7 +756,7 @@ def _parse_blocks(
         blocks = parse_notebook(path, cache_dir)
         enrich_blocks_with_vlm(
             blocks, base_url=vlm_base_url, api_key=vlm_api_key,
-            model_id=vlm_model_id, cache_dir=cache_dir, concurrency=settings.vlm_concurrency,
+            model_id=vlm_model_id, cache_dir=cache_dir, concurrency=vlm_concurrency,
             filter_decorative=False, vlm_options=vlm_options, caption_cache_root=caption_cache_root,
             prompt=vlm_prompt, progress_cb=vlm_progress,
         )
@@ -776,7 +768,7 @@ def _parse_blocks(
             vlm_base_url=vlm_base_url,
             vlm_api_key=vlm_api_key,
             vlm_model_id=vlm_model_id,
-            vlm_concurrency=settings.vlm_concurrency,
+            vlm_concurrency=vlm_concurrency,
             vlm_options=vlm_options,
             caption_cache_root=caption_cache_root,
             vlm_prompt=vlm_prompt,
@@ -788,7 +780,7 @@ def _parse_blocks(
             vlm_base_url=vlm_base_url,
             vlm_api_key=vlm_api_key,
             vlm_model_id=vlm_model_id,
-            vlm_concurrency=settings.vlm_concurrency,
+            vlm_concurrency=vlm_concurrency,
             path=path,
             cache_dir=cache_dir,
             merge_target_tokens=source.block_merge_tokens,
@@ -805,7 +797,7 @@ def _parse_blocks(
             vlm_base_url=vlm_base_url,
             vlm_api_key=vlm_api_key,
             vlm_model_id=vlm_model_id,
-            vlm_concurrency=settings.vlm_concurrency,
+            vlm_concurrency=vlm_concurrency,
             path=path,
             cache_dir=cache_dir,
             timeout=settings.mineru_timeout_seconds,
@@ -820,7 +812,7 @@ def _parse_blocks(
             vlm_base_url=vlm_base_url,
             vlm_api_key=vlm_api_key,
             vlm_model_id=vlm_model_id,
-            vlm_concurrency=settings.vlm_concurrency,
+            vlm_concurrency=vlm_concurrency,
             path=path,
             cache_dir=cache_dir,
             merge_target_tokens=source.block_merge_tokens,
@@ -844,10 +836,10 @@ def _parse_blocks(
             from ..parsers.visual_blocks import enrich_blocks_with_vlm, ensure_visual_blocks_have_text
             images = extract_xlsx_images(path, cache_dir)
             if any(b.visual_ref for b in images):
-                vlm_base_url, vlm_api_key, vlm_model_id = _vlm_endpoint(settings, source)
+                vlm_base_url, vlm_api_key, vlm_model_id, vlm_concurrency = _vlm_endpoint(settings, source)
                 vlm_progress = vlm_progress_callback(stage_cb, vlm_model_id)
                 enrich_blocks_with_vlm(images, base_url=vlm_base_url, api_key=vlm_api_key,
-                    model_id=vlm_model_id, cache_dir=cache_dir, concurrency=settings.vlm_concurrency,
+                    model_id=vlm_model_id, cache_dir=cache_dir, concurrency=vlm_concurrency,
                     vlm_options=vlm_options, caption_cache_root=caption_cache_root,
                     prompt=compose_prompt("figure", vlm_prompt), progress_cb=vlm_progress)
                 ensure_visual_blocks_have_text(images, doc_name=path.name)

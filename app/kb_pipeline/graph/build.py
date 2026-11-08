@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Iterable, Callable
 
 from .. import db
+from ..storage import get_storage
 from ..config import Settings
 from ..models import KBSource
 from ..utils import stable_json_hash
@@ -46,18 +47,11 @@ from ..vector.qdrant import (
     GRAPH_OPTIONAL_TYPES,
     GRAPH_VECTOR_TYPES,
     LEGACY_GRAPH_VECTOR_TYPES,
-    activate_graph_aliases,
-    client as qdrant_client,
-    collection_exists,
-    delete_old_graph_collections,
-    drop_graph_aliases,
-    graph_alias_targets,
     graph_collection_alias,
     graph_collection_name,
     graph_collection_short_name,
     graph_version_timestamp,
     parse_graph_collection_name,
-    restore_graph_aliases,
 )
 from . import prompts, unit_cache
 from .corrections import (
@@ -491,7 +485,7 @@ def facts_phase_gate(failed: list[tuple[Any, BaseException]], *, partial_ok: boo
 
 
 class _StoppableEmbedder:
-    """A wrapper around the embedding client: one batch per call, with a stop-signal check after every batch. The
+    """A wrapper around the embedding client: one bounded group per call, with a stop check between groups. The
     client's retries swallow an interruption that lands inside an HTTP call as an ordinary error, and the
     resolution phase embeds tens of thousands of titles at once; without the checks the process would be killed
     before the embedding finished."""
@@ -502,8 +496,9 @@ class _StoppableEmbedder:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
-        step = max(1, int(self.client.batch_size))
+        step = max(1, int(self.client.batch_size)) * max(1, int(getattr(self.client, "concurrency", 1)))
         for start in range(0, len(texts), step):
+            self.check_stop()
             vectors.extend(self.client.embed(texts[start:start + step]))
             self.check_stop()
         return vectors
@@ -520,6 +515,7 @@ def graph_embedder(settings: Settings, check_stop: Callable[[], None] | None = N
     client = EmbeddingClient(
         base_url=settings.embedding_base_url, api_key=settings.embedding_api_key,
         model_id=settings.embedding_model_id, dim=settings.embedding_dim, batch_size=settings.embedding_batch,
+        concurrency=getattr(settings, "embedding_concurrency", 1),
         retry=settings.embedding_retry, sleep_seconds=settings.embedding_sleep_seconds,
     )
     return client if check_stop is None else _StoppableEmbedder(client, check_stop)
@@ -573,12 +569,12 @@ def filter_chunk_refs(chunks: list[dict[str, str]], doc_ids: Iterable[str] | Non
     return [c for c in chunks if doc_of(c) in wanted]
 
 
-def prepare_graph_input(settings: Settings, source: KBSource, *, paths: GraphPaths, q: Any = None,
+def prepare_graph_input(settings: Settings, source: KBSource, *, paths: GraphPaths, q: Any = None, storage: Any = None,
                         write_units_file: bool = True, doc_ids: Iterable[str] | None = None) -> tuple[dict[str, Any], list[dict[str, str]], list[Any]]:
     """Graph build input = the active chunk ledger at this moment + extraction units assembled from the chunk
     payloads fetched from the main store. Returns (manifest, chunks, units). With doc_ids, only those documents
     are used (trial build)."""
-    from .units import build_units, fetch_chunk_payloads, units_summary, write_units
+    from .units import build_units, units_summary, write_units
 
     with db.connect(settings.state_db) as con:
         chunks = filter_chunk_refs(db.active_chunk_refs(con, source.collection), doc_ids)
@@ -588,8 +584,8 @@ def prepare_graph_input(settings: Settings, source: KBSource, *, paths: GraphPat
         )
     from .temporal import axis_for_units
 
-    q = q or qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-    payloads = fetch_chunk_payloads(q, source.collection, chunks)
+    store = storage if storage is not None else get_storage(settings, vector_client=q)
+    payloads = store.graph.corpus_payloads(source.collection, chunks)
     drift = input_drift(chunks, payloads)
     if drift["missing"] or drift["text_mismatch"] or drift["version_mismatch"]:
         # Missing points and misaligned text were once skipped silently, with the full ledger recorded as baseline,
@@ -835,10 +831,10 @@ def build_graph(
             db.set_graph_build_stage(stage_con, build_id, label)
 
     try:
-        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        store = get_storage(settings)
         graph_types = list(GRAPH_VECTOR_TYPES)
         if not allow_existing_graph_version:
-            existing = {item.name for item in q.get_collections().collections}
+            existing = store.graph.vector_collections()
             targets = [graph_collection_name(source.collection, t, graph_version) for t in graph_types]
             collisions = [name for name in targets if name in existing]
             if collisions:
@@ -847,14 +843,8 @@ def build_graph(
         # Preflight checks go first (before creating the record and workspace): models all set, Neo4j reachable.
         specs = resolve_llm_specs(settings, source, GRAPH_LLM_STEPS)
         if settings.graph_neo4j_import_after_build and not dry_run:
-            from .neo4j_import import neo4j_driver
-
             try:
-                driver = neo4j_driver(settings)
-                try:
-                    driver.verify_connectivity()
-                finally:
-                    driver.close()
+                store.graph.check()
             except Exception as exc:
                 raise RuntimeError(
                     f"Neo4j is unavailable ({exc.__class__.__name__}); the build does not start so LLM calls are not wasted. "
@@ -987,7 +977,7 @@ def build_graph(
         # ── 1. Prepare corpus ──
         def prepare():
             paths.work_dir.mkdir(parents=True, exist_ok=True)
-            manifest, chunks, _units = prepare_graph_input(settings, source, paths=paths, q=q, write_units_file=not dry_run,
+            manifest, chunks, _units = prepare_graph_input(settings, source, paths=paths, storage=store, write_units_file=not dry_run,
                                                           doc_ids=doc_ids)
             if not dry_run:
                 with db.connect(settings.state_db) as con:
@@ -1030,7 +1020,7 @@ def build_graph(
             units = read_units(paths.units_file)
             cache = LLMCache(paths.cache_file)
             client = ChatClient(specs["extract"], cache=cache, stop=stop_event,
-                                timeout=settings.graph_llm_timeout_seconds, workers=settings.graph_llm_concurrency,
+                                timeout=settings.graph_llm_timeout_seconds,
                                 circuit_fails=settings.graph_circuit_fails)
             try:
                 extractor = GraphExtractor(client, schema, max_gleanings=source.graph_max_gleanings)
@@ -1171,7 +1161,6 @@ def build_graph(
             from .merge import attribute_mentions, combine_unit_kind, compute_weights, merge_extractions
             from .resolution import resolve as resolve_entities
             from .summarize import summarize_rows
-            from .units import fetch_chunk_payloads
 
             from .deterministic import ALLOWED_ENDS as DET_ENDS, TYPES as DET_TYPES, UPPER as DET_UPPER
 
@@ -1249,7 +1238,7 @@ def build_graph(
                 raise RuntimeError("No entities left after merging")
             cache = LLMCache(paths.cache_file)
             client = ChatClient(specs["summarize"], cache=cache, stop=stop_event,
-                                timeout=settings.graph_llm_timeout_seconds, workers=settings.graph_llm_concurrency,
+                                timeout=settings.graph_llm_timeout_seconds,
                                 circuit_fails=settings.graph_circuit_fails)
             embedder = graph_embedder(settings, check_stop)
             try:
@@ -1296,7 +1285,7 @@ def build_graph(
             # 来源文档全都不是现行的关系(被取代 / 归档 / 过了有效期):记 doc_status,检索默认不走它们
             stats["currency"]["non_current_relations"] = mark_document_status(
                 relations, corr, rel_of_doc={u.doc_id: u.rel_path for u in units}, today=time.strftime("%Y-%m-%d"))
-            payloads = fetch_chunk_payloads(q, source.collection, build_chunks)
+            payloads = store.graph.corpus_payloads(source.collection, build_chunks)
             chunk_texts, chunk_sections, stale_chunks = attribution_texts(build_chunks, payloads)
             if stale_chunks:
                 print(f"[graph] {stale_chunks} chunks changed text since the corpus was frozen; "
@@ -1363,13 +1352,13 @@ def build_graph(
                              and wants_narrative_facts(u, kinds.get(u.unit_id))]
                 narrative_ids = {u.unit_id for u in narrative}
                 todo_units = todo_units + narrative
-            doc_paths = {u.doc_id: u.rel_path for u in units}       # 文档路径是主体身份的证据(李华/体检报告/…、CY7C1049GN/…)
+            doc_paths = {u.doc_id: u.rel_path for u in units}       # 文档路径可为主体身份提供上下文。
             # 候选主体按单元给:这一段里出现的人员与组织、实体排在整份文档的主要主体前面(长文档一份讲好几样东西)
             subjects = unit_subjects(todo_units, graph.get("entities") or [],
                                      subject_types=(graph.get("profile") or {}).get("subject_types") or (), documents=doc_paths)
             cache = LLMCache(paths.cache_file)
             client = ChatClient(specs["extract"], cache=cache, stop=stop_event,
-                                timeout=settings.graph_llm_timeout_seconds, workers=settings.graph_llm_concurrency,
+                                timeout=settings.graph_llm_timeout_seconds,
                                 circuit_fails=settings.graph_circuit_fails)
             try:
                 extractor = FactExtractor(client)
@@ -1529,7 +1518,7 @@ def build_graph(
             units = read_units(paths.units_file)
             cache = LLMCache(paths.cache_file)
             client = ChatClient(specs["summarize"], cache=cache, stop=stop_event,
-                                timeout=settings.graph_llm_timeout_seconds, workers=settings.graph_llm_concurrency,
+                                timeout=settings.graph_llm_timeout_seconds,
                                 circuit_fails=settings.graph_circuit_fails)
             try:
                 pages, stats = compile_pages(graph, units, out_dir=paths.work_dir / "wiki", language=schema.language,
@@ -1577,8 +1566,6 @@ def build_graph(
 
         # ── 4. Write vectors ──
         def enrich() -> dict[str, Any]:
-            from .vectors import write_graph_vectors
-
             graph = json.loads(paths.graph_file.read_text(encoding="utf-8"))
             units_by_id = {u.unit_id: u for u in read_units(paths.units_file)}
             embedder = graph_embedder(settings, check_stop)
@@ -1587,8 +1574,8 @@ def build_graph(
             base_version = str(base_row["graph_version"]) if (incremental and base_row is not None) else None
             if base_version:
                 reuse_from = {t: graph_collection_name(source.collection, t, base_version) for t in GRAPH_VECTOR_TYPES}
-            return write_graph_vectors(
-                q, embedder.embed, kb_id=source.kb_id, source_collection=source.collection,
+            return store.graph.write_vectors(
+                embedder.embed, kb_id=source.kb_id, source_collection=source.collection,
                 graph_version=graph_version, bundle=graph, units_by_id=units_by_id,
                 vector_size=settings.embedding_dim, stage=lambda label: progress(label),
                 reuse_from=reuse_from, base_version=base_version, embed_model=settings.embedding_model_id,
@@ -1606,13 +1593,11 @@ def build_graph(
         active_doc_count = len({c["doc_id"] for c in chunks if c.get("doc_id")})
         input_rows = int((input_manifest or {}).get("documents") or 0)
         if settings.graph_neo4j_import_after_build and should_import:
-            from .neo4j_import import import_graph_to_neo4j
-
             content_hash = source_snapshot_hash(chunks)
 
             def neo4j_import() -> dict[str, Any]:
-                return import_graph_to_neo4j(
-                    settings, source_key=source_key, source=source, graph_version=graph_version,
+                return store.graph.import_version(
+                    source_key=source_key, source=source, graph_version=graph_version,
                     replace=True, activate=False, dry_run=False, batch_size=settings.graph_neo4j_import_batch_size,
                     build_record={
                         "graph_build_id": build_id, "source_key": source_key, "kb_id": source.kb_id,
@@ -1651,20 +1636,18 @@ def build_graph(
                 # getting here means it was not found at the time
                 raise GraphBuildCalledOff(f"{switched_off}; this version is not published")
             stage("Switching version aliases")
-            alias_result = activate_graph_aliases(q, source_collection=source.collection, graph_version=graph_version)
+            alias_result = store.graph.activate_vectors(source_collection=source.collection, graph_version=graph_version)
             result["qdrant_alias_activation"] = alias_result
             # Aliases left by legacy types (the old pipeline's communities, the removed summary tree) no longer
             # represent the current graph
-            result["stale_aliases_dropped"] = drop_graph_aliases(q, source.collection, LEGACY_GRAPH_VECTOR_TYPES)
+            result["stale_aliases_dropped"] = store.graph.drop_aliases(source.collection, LEGACY_GRAPH_VECTOR_TYPES)
             result["steps"].append("activate_qdrant_aliases")
             if settings.graph_neo4j_import_after_build:
-                from .neo4j_import import activate_neo4j_graph_version
-
                 try:
-                    result["neo4j_activation"] = activate_neo4j_graph_version(settings, source=source, graph_version=graph_version)
+                    result["neo4j_activation"] = store.graph.activate(source=source, graph_version=graph_version)
                 except Exception:
                     try:
-                        restore_graph_aliases(q, alias_result["previous"])
+                        store.graph.restore_vectors(alias_result["previous"])
                         result["steps"].append("rollback_qdrant_aliases")
                     except Exception as rollback_exc:
                         result["inconsistent"] = {"qdrant_aliases": "new", "neo4j": "old", "rollback_error": repr(rollback_exc)}
@@ -1720,7 +1703,7 @@ def build_graph(
         try:
             if run_gc and should_activate:
                 stage("Cleaning up old versions")
-                gc = gc_graph_versions(settings, source, q=q, graph_version=graph_version,
+                gc = gc_graph_versions(settings, source, storage=store, graph_version=graph_version,
                                        grace_seconds=int(getattr(settings, "graph_gc_grace_seconds", 0) or 0))
                 result.update(gc["result"])
                 result["steps"].extend(gc["steps"])
@@ -1906,7 +1889,7 @@ def _prune_graph_workspaces(settings: Settings, source: KBSource, *, keep_versio
             "discard_versions": sorted(discard), "protect_versions": sorted(protect), "dry_run": dry_run}
 
 
-def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_version: str,
+def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any = None, storage: Any = None, graph_version: str,
                       keep_latest: int | None = None, discard: set[str] | None = None,
                       protect: set[str] | None = None,
                       grace_seconds: int = 0, dry_run: bool = False) -> dict[str, Any]:
@@ -1924,6 +1907,7 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
     A stop signal (GraphBuildInterrupted / LLMInterrupted) is not swallowed as a failed step; it is passed on
     to the caller.
     Returns {"result": per-step results, "steps": step names to record, "errors": failed steps}."""
+    store = storage if storage is not None else get_storage(settings, vector_client=q)
     keep = max(1, int(keep_latest if keep_latest is not None else getattr(settings, "graph_gc_keep_versions", 3) or 3))
     result: dict[str, Any] = {}
     steps: list[str] = []
@@ -1970,17 +1954,15 @@ def gc_graph_versions(settings: Settings, source: KBSource, *, q: Any, graph_ver
                     version_timestamps[(short, version_dir.name)] = int(version_dir.stat().st_mtime)
             except OSError:
                 continue
-    gc_step("graph_gc", lambda: delete_old_graph_collections(
-        q, source_collections=[source.collection], retention_days=settings.graph_gc_retention_days, dry_run=dry_run,
+    gc_step("graph_gc", lambda: store.graph.collect_vectors(
+        source_collections=[source.collection], retention_days=settings.graph_gc_retention_days, dry_run=dry_run,
         keep_latest=keep, discard_versions=discard, protect_versions=protect, version_timestamps=version_timestamps))
     gc_step("workspace_gc", lambda: _prune_graph_workspaces(
         settings, source, keep_version=graph_version, retention_days=settings.graph_gc_retention_days,
         keep_latest=keep, discard_versions=discard, protect_versions=protect, dry_run=dry_run), step=False)
     if settings.graph_neo4j_import_after_build:
-        from .neo4j_import import delete_old_neo4j_graph_versions
-
-        gc_step("neo4j_graph_gc", lambda: delete_old_neo4j_graph_versions(
-            settings, sources=[source], retention_days=settings.neo4j_graph_retention_days, dry_run=dry_run,
+        gc_step("neo4j_graph_gc", lambda: store.graph.collect_versions(
+            sources=[source], retention_days=settings.neo4j_graph_retention_days, dry_run=dry_run,
             keep_latest=keep, discard_versions=discard, protect_versions=protect))
     # The kept versions (active, inside the keep window, kept for a resume) keep their records too: the status
     # card still has their sizes and figures after a rollback to them
@@ -2007,6 +1989,9 @@ def _shutdown_probe() -> dict[str, Any]:
     things, so its state is only recorded for reference. When nothing can be asked (no systemd, a timeout) the answer
     is "not shutting down" -- better not to resume on its own. is-system-running exits 0 only when running and prints
     the other states all the same, so only the output is read, not the exit code."""
+    if os.getenv("KB_RUNTIME") == "container":
+        from kb_runtime.queue import state_dir
+        return {"system_state": {"runtime": "container"}, "shutdown": (state_dir() / "container-stopping").exists()}
     states: dict[str, str] = {}
     for scope, cmd in (("user", ["systemctl", "--user", "is-system-running"]),
                        ("system", ["systemctl", "is-system-running"])):
@@ -2290,8 +2275,8 @@ def adopt_current_graph(settings: Settings, *, source_key: str, source: KBSource
     if not source.graph_enabled:
         raise ValueError(f"source {source_key!r} has graph_enabled=false")
 
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-    aliases = {item.alias_name: item.collection_name for item in q.get_aliases().aliases}
+    store = get_storage(settings)
+    aliases = store.graph.vector_aliases()
     inferred_versions: dict[str, str] = {}
     targets: dict[str, str | None] = {}
     for graph_type in GRAPH_VECTOR_TYPES:
@@ -2352,7 +2337,7 @@ def adopt_current_graph(settings: Settings, *, source_key: str, source: KBSource
 
 
 def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSource, graph_version: str,
-                           q: Any = None, grace_seconds: int | None = None, force: bool = False) -> dict[str, Any]:
+                           q: Any = None, storage: Any = None, grace_seconds: int | None = None, force: bool = False) -> dict[str, Any]:
     """Roll the live graph back to an earlier version that is still kept. Switches the Qdrant aliases,
     activates the Neo4j version (re-imported from the workspace when its projection is gone), records it
     (the target becomes the latest successful build; newer successful versions are marked rolled_back) and
@@ -2371,9 +2356,9 @@ def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSou
     guard = GraphBuildLock(settings)          # same lock as a build: never switch versions under a running build
     guard.acquire()
     try:
-        q = q or qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        store = storage if storage is not None else get_storage(settings, vector_client=q)
         current_versions: set[str] = set()
-        for target in graph_alias_targets(q, source.collection).values():
+        for target in store.graph.alias_targets(source.collection).values():
             parsed = parse_graph_collection_name(str(target)) if target else None
             if parsed:
                 current_versions.add(str(parsed["graph_version"]))
@@ -2382,45 +2367,36 @@ def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSou
             raise ValueError(f"{graph_version} is already the active graph version of {source.kb_id}")
         required = [t for t in GRAPH_VECTOR_TYPES if t not in GRAPH_OPTIONAL_TYPES]
         missing = [graph_collection_name(source.collection, t, graph_version) for t in required
-                   if not collection_exists(q, graph_collection_name(source.collection, t, graph_version))]
+                   if not store.graph.vector_exists(graph_collection_name(source.collection, t, graph_version))]
         if missing:
             raise ValueError(f"cannot roll back {source.kb_id} to {graph_version}: graph collection(s) missing: {missing}")
         paths = graph_paths(settings, source, graph_version)
         if not paths.graph_file.exists():
             raise ValueError(f"cannot roll back {source.kb_id} to {graph_version}: workspace {paths.graph_file} is gone "
                              "(incremental appends replay from it)")
-        target = _rollback_target_check(settings, source, q, graph_version=graph_version, force=force)
+        target = _rollback_target_check(settings, source, store, graph_version=graph_version, force=force)
         result: dict[str, Any] = {"source": source_key, "kb_id": source.kb_id, "source_collection": source.collection,
                                   "from_graph_version": current, "graph_version": graph_version, "steps": [],
                                   "target": target["summary"]}
         use_neo4j = bool(getattr(settings, "graph_neo4j_import_after_build", False))
         if use_neo4j:
-            from .neo4j_import import (activate_neo4j_graph_version, count_version_nodes, counts_match,
-                                       import_graph_to_neo4j, neo4j_counts, neo4j_driver)
-
-            driver = neo4j_driver(settings)
-            try:
-                nodes = count_version_nodes(driver, source.kb_id, graph_version)
-                expected = target["neo4j_expected"]
-                intact = bool(nodes > 0 and expected and counts_match(expected, neo4j_counts(driver, source.kb_id, graph_version)))
-            finally:
-                driver.close()
+            intact = store.graph.projection_matches(source.kb_id, graph_version, target["neo4j_expected"])
             if not intact:
                 # The target's Neo4j projection is gone, or does not match the recorded counts (a half-written
                 # projection): re-import it from the workspace, without activating
-                result["neo4j_reimport"] = import_graph_to_neo4j(
-                    settings, source_key=source_key, source=source, graph_version=graph_version,
+                result["neo4j_reimport"] = store.graph.import_version(
+                    source_key=source_key, source=source, graph_version=graph_version,
                     replace=True, activate=False, require_qdrant_aliases=False)
                 result["steps"].append("neo4j_reimport")
-        alias_result = activate_graph_aliases(q, source_collection=source.collection, graph_version=graph_version)
+        alias_result = store.graph.activate_vectors(source_collection=source.collection, graph_version=graph_version)
         result["qdrant_alias_activation"] = alias_result
         result["steps"].append("activate_qdrant_aliases")
         if use_neo4j:
             try:
-                result["neo4j_activation"] = activate_neo4j_graph_version(settings, source=source, graph_version=graph_version)
+                result["neo4j_activation"] = store.graph.activate(source=source, graph_version=graph_version)
             except Exception:
                 try:
-                    restore_graph_aliases(q, alias_result["previous"])
+                    store.graph.restore_vectors(alias_result["previous"])
                     result["steps"].append("rollback_qdrant_aliases")
                 except Exception as rollback_exc:
                     result["inconsistent"] = {"qdrant_aliases": "new", "neo4j": "old", "rollback_error": repr(rollback_exc)}
@@ -2433,7 +2409,7 @@ def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSou
                                                  rolled_back_from=current, chunks=chunks, output_dir=str(paths.output_dir))
         result["steps"].append("record")
         grace = int(grace_seconds if grace_seconds is not None else getattr(settings, "graph_gc_grace_seconds", 0) or 0)
-        gc = gc_graph_versions(settings, source, q=q, graph_version=graph_version, grace_seconds=grace)
+        gc = gc_graph_versions(settings, source, storage=store, graph_version=graph_version, grace_seconds=grace)
         result.update(gc["result"])
         result["steps"].extend(gc["steps"])
         if gc["errors"]:
@@ -2444,7 +2420,7 @@ def rollback_graph_version(settings: Settings, *, source_key: str, source: KBSou
         guard.release()
 
 
-def _rollback_target_check(settings: Settings, source: KBSource, q: Any, *, graph_version: str, force: bool) -> dict[str, Any]:
+def _rollback_target_check(settings: Settings, source: KBSource, store: Any, *, graph_version: str, force: bool) -> dict[str, Any]:
     """Whether the rollback target is a version that was built and is still complete. A record that is not done
     / rolled_back (paused, failed, still running), or no record at all, is refused unless ``force`` is given:
     with KEEP=1 such half-finished versions are the only ones a rollback could reach, and switching to one also
@@ -2472,9 +2448,9 @@ def _rollback_target_check(settings: Settings, source: KBSource, q: Any, *, grap
     mismatched: list[str] = []
     for graph_type in GRAPH_VECTOR_TYPES:
         collection = graph_collection_name(source.collection, graph_type, graph_version)
-        if not collection_exists(q, collection):
+        if not store.graph.vector_exists(collection):
             continue                      # required types were checked by the caller; an optional type without a collection had no rows
-        actual = int(q.count(collection_name=collection, exact=True).count)
+        actual = store.graph.vector_count(collection)
         want = (recorded.get(graph_type) or {}).get("points") if isinstance(recorded.get(graph_type), dict) else None
         counts[graph_type] = {"points": actual, "recorded": want}
         if want is not None and int(want) != actual:
@@ -2559,7 +2535,7 @@ def graph_retirable(settings: Settings, source: KBSource) -> list[str]:
     return versions
 
 
-def retire_graph(settings: Settings, *, source_key: str, source: KBSource, q: Any = None,
+def retire_graph(settings: Settings, *, source_key: str, source: KBSource, q: Any = None, storage: Any = None,
                  grace_seconds: int | None = None) -> dict[str, Any] | None:
     """Retire the graph of a KB that has been emptied. Without a corpus no append or rebuild ever happens, so the
     current version would keep its aliases and search would go on returning entities, facts and pages of deleted
@@ -2576,21 +2552,19 @@ def retire_graph(settings: Settings, *, source_key: str, source: KBSource, q: An
         versions = graph_retirable(settings, source)
         if not versions:
             return None
-        q = q or qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        store = storage if storage is not None else get_storage(settings, vector_client=q)
         result: dict[str, Any] = {"source": source_key, "kb_id": source.kb_id, "retired_versions": versions, "steps": []}
-        result["aliases_dropped"] = drop_graph_aliases(q, source.collection, ALL_GRAPH_VECTOR_TYPES)
+        result["aliases_dropped"] = store.graph.drop_aliases(source.collection, ALL_GRAPH_VECTOR_TYPES)
         result["steps"].append("drop_qdrant_aliases")
         if getattr(settings, "graph_neo4j_import_after_build", False):
-            from .neo4j_import import deactivate_neo4j_graph_version
-
-            result["neo4j_deactivation"] = deactivate_neo4j_graph_version(settings, source=source)
+            result["neo4j_deactivation"] = store.graph.deactivate(source)
             result["steps"].append("deactivate_neo4j")
         with db.connect(settings.state_db) as con:
             con.execute("UPDATE graph_builds SET status = 'rolled_back', error = ? WHERE kb_id = ? AND status = 'done'",
                         ("retired: the knowledge base has no active content", source.kb_id))
         result["steps"].append("record")
         grace = int(grace_seconds if grace_seconds is not None else getattr(settings, "graph_gc_grace_seconds", 0) or 0)
-        gc = gc_graph_versions(settings, source, q=q, graph_version="", grace_seconds=grace)
+        gc = gc_graph_versions(settings, source, storage=store, graph_version="", grace_seconds=grace)
         result.update(gc["result"])
         result["steps"].extend(gc["steps"])
         if gc["errors"]:

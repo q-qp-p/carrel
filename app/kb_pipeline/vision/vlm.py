@@ -14,7 +14,7 @@ from ..parse_cache import reusable_in_run, write_cache
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI
+from openai import OpenAI, omit
 
 from ..llm_compat import CompatibleRequest, generation_parameters, sdk_arguments
 from ..parsers.errors import JobCancelled, service_unreachable
@@ -166,7 +166,7 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
             # hangs. Give it a cap proportionate to an image description (the embedding client has
             # done this for a long time).
             client = OpenAI(
-                api_key=api_key,
+                api_key=api_key or "not-required",
                 base_url=base_url,
                 timeout=float(os.getenv("VLM_TIMEOUT_SECONDS", "180")),
                 max_retries=int(os.getenv("VLM_MAX_RETRIES", "1")),
@@ -175,13 +175,14 @@ def _client_for(base_url: str, api_key: str) -> OpenAI:
     return client
 
 
-def _compatible_completion(client: OpenAI, request: CompatibleRequest):
+def _compatible_completion(client: OpenAI, request: CompatibleRequest, *, api_key: str | None = None):
     while True:
         body = copy.deepcopy(request.body)
         if "response_format" not in body:
             body["messages"][0]["content"][0]["text"] += "\n\nOutput exactly one JSON object and nothing else."
         try:
-            return client.chat.completions.create(**sdk_arguments(body))
+            return client.chat.completions.create(**sdk_arguments(body),
+                **({"extra_headers": {"Authorization": omit}} if api_key == "" else {}))
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             # SDK errors expose the server's JSON body separately from their display text.
@@ -563,7 +564,7 @@ def caption_image(
             ],
         }
     ]
-    resp = _compatible_completion(client, request)
+    resp = _compatible_completion(client, request, api_key=api_key)
     constrained = "response_format" in request.body
 
     content = resp.choices[0].message.content or ""
@@ -590,7 +591,7 @@ def caption_image(
         token_key = "max_completion_tokens" if "max_completion_tokens" in retry_body else "max_tokens"
         retry_body[token_key] = min(8192, max_tokens * 2)
         try:
-            retry_response = _compatible_completion(client, CompatibleRequest(base_url, model_id, "openai", retry_body))
+            retry_response = _compatible_completion(client, CompatibleRequest(base_url, model_id, "openai", retry_body), api_key=api_key)
             _log_caption_usage(retry_response, retry_body[token_key])
             candidate = parse_jsonish(retry_response.choices[0].message.content or "")
             candidate_finish = str(getattr(retry_response.choices[0], "finish_reason", "") or "")
@@ -626,7 +627,7 @@ def caption_image(
             }
         ]
         degraded_request = CompatibleRequest(base_url, model_id, "openai", retry)
-        resp = _compatible_completion(client, degraded_request)
+        resp = _compatible_completion(client, degraded_request, api_key=api_key)
         constrained = "response_format" in degraded_request.body
         content = resp.choices[0].message.content or ""
         finish_reason = str(getattr(resp.choices[0], "finish_reason", "") or "")

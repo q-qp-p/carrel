@@ -402,7 +402,14 @@ class GraphPauseTests(unittest.TestCase):
         """Write, but only this key -- a pause that also changed other config would be another surprise."""
         code = self._pause_code()
         self.assertIn('set_config(con, kb_id, {"graph_paused": True})', code)
-        self.assertEqual(code.count("set_config"), 1)
+        # Both a queued container dispatch and a running build may be paused.
+        import ast
+        import textwrap
+        calls = [node for node in ast.walk(ast.parse("def pause():\n" + textwrap.indent(textwrap.dedent(code), "    ")))
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                 and node.func.attr == "set_config"]
+        self.assertTrue(calls)
+        self.assertTrue(all(ast.literal_eval(call.args[2]) == {"graph_paused": True} for call in calls))
 
     def test_resuming_clears_the_intent(self) -> None:
         """Both "build now / rebuild" and "enable graph" are explicit intents to resume. If the flag is not
@@ -492,28 +499,24 @@ class GraphPauseTests(unittest.TestCase):
         guard = body.rindex('"cancelled"', 0, index)
         self.assertGreater(index, guard, "数缓存必须被停止态判定守着")
 
-    def test_console_offers_pause_while_building_and_resume_after(self) -> None:
-        """While building, pause is the only option; after a pause the button is relabelled "resume build" --
-        calling it "build now / rebuild" would suggest starting over, whereas the cache actually makes the
-        completed calls return instantly."""
+    def test_console_uses_one_stateful_button_per_pipeline(self) -> None:
         js = _repo_file("app/kb_server/static/app.js")
-        self.assertIn('$("#cfg-gpause").disabled = !(active && building)', js)
-        self.assertIn('$("#cfg-gbuild").disabled = !(active && $("#cfg-graph").checked) || building', js)
-        # "Resume" is a promise about cost, used only when the server confirms the cache can really carry on --
-        # after switching the build model, re-extracting labels or changing chunking parameters the old cache
-        # is useless, and clicking it then means hours of a full rerun. See service._paused_cache_reuse.
-        self.assertIn('canResume ? "继续建图" : "立即/重新建图"', js)
-        self.assertIn("gb.cache_reusable === true", js)
         html = _repo_file("app/kb_server/static/index.html")
-        self.assertIn('id="cfg-gpause"', html)
+        for removed in ("cfg-gpause", "cfg-parse-pause"):
+            self.assertNotIn(removed, html)
+            self.assertNotIn(removed, js)
+        for label in ("立即解析", "继续解析", "暂停解析", "立即建图", "继续建图", "暂停建图"):
+            self.assertIn(label, js)
+        self.assertIn('graphAction(kb)', js)
+        self.assertIn('parseAction(kb)', js)
+        self.assertIn('id="cfg-grebuild"', html)
 
     def test_the_pause_dialog_warns_about_cache_invalidation(self) -> None:
         """Changing the model / labels / language / chunking during a pause invalidates the whole cache, turning
         "resume" into a rerun. It is the one pitfall of pausing and must be stated in the dialog, not only in
         a commit message."""
         js = _repo_file("app/kb_server/static/app.js")
-        # The first $("#cfg-gpause") is the disabled assignment in renderConfig; we want the event handler
-        dialog = js.split('$("#cfg-gpause").addEventListener', 1)[1].split("\n});", 1)[0]
+        dialog = js.split("async function pauseGraphBuild", 1)[1].split("\n}", 1)[0]
         self.assertIn("缓存", dialog)
         for knob in ("模型", "标签", "谓词", "语言", "合并切片数"):
             self.assertIn(knob, dialog, knob)
@@ -690,8 +693,98 @@ class GraphSaveAndPauseSemanticsTests(unittest.TestCase):
                     service.trigger_graph_build(source.kb_id)
                 self.assertEqual(spawned[-1], {"graph_version": "v2"})            # a full build that stopped midway still resumes its version
         js = _repo_file("app/kb_server/static/app.js")
-        self.assertIn("resumeAppend ?", js)
-        self.assertIn("const liveGraph = kb.graph_status === \"ok\" || (halted && !!(kb.graph_build || {}).active_graph_version);", js)
+        self.assertIn('startGraphBuild("run")', js)
+
+
+    def test_run_resume_and_full_rebuild_are_separate_actions(self) -> None:
+        from unittest import mock
+
+        from kb_pipeline import discovery
+        from kb_server import service
+
+        cases = [
+            # mode, successful base, interrupted kind, cache reusable, expected action
+            ("run", False, None, True, {}),
+            ("run", True, None, True, "append"),
+            ("run", True, "append", True, {"append": True, "force": True}),
+            ("run", False, "full", True, {"graph_version": "v2"}),
+            ("run", True, "full", False, "refuse"),
+            ("run", True, "append", False, "refuse"),
+            ("rebuild", True, None, True, {"graph_version": None}),
+            ("rebuild", True, "append", True, {"graph_version": None}),
+            ("rebuild", True, "full", True, {"graph_version": None}),
+            ("rebuild", True, "full", False, {"graph_version": None}),
+        ]
+        for mode, base, interrupted, reusable, expected in cases:
+            with self.subTest(mode=mode, base=base, interrupted=interrupted, reusable=reusable), \
+                    tempfile.TemporaryDirectory() as tmp:
+                source, cfg, _ = self._env(tmp, {"graph_enabled": True, "graph_paused": bool(interrupted)})
+                cfg.mirror_root = Path(tmp) / "mirror"
+                with db.connect(cfg.state_db) as con:
+                    records = [("v1", "done", "full", 100)] if base else []
+                    if interrupted:
+                        records.append(("v2", "cancelled", interrupted, 200))
+                    for version, status, kind, started in records:
+                        con.execute(
+                            "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, "
+                            "graph_version, status, started_at, finished_at, build_kind) VALUES(?,?,?,?,?,?,?,?,?)",
+                            (version, source.kb_id, source.kb_id, source.collection, version, status, started, started + 1, kind))
+                    con.commit()
+                def gate(con, cfg, kb_id):
+                    return {"source_root": "docs", "collection": source.collection}, {}, con.execute("SELECT * FROM graph_builds ORDER BY started_at DESC LIMIT 1").fetchone()
+                with mock.patch.object(service, "settings", return_value=cfg), \
+                        mock.patch.object(service, "_graph_action_gate", side_effect=gate), \
+                        mock.patch.object(service, "_paused_cache_reuse", return_value={"cache_reusable": reusable}), \
+                        mock.patch.object(db, "graph_phases_done", return_value=["extract"]), \
+                        mock.patch.object(service, "trigger_graph_append", return_value={"append": True}) as append, \
+                        mock.patch.object(service, "_graph_run_decision", return_value={"kind": "append" if base else "build"}), \
+                        mock.patch.object(service, "_spawn_graph_build", return_value={"started": True}) as spawn:
+                    if expected == "refuse":
+                        with self.assertRaisesRegex(ValueError, "use Rebuild all"):
+                            service.trigger_graph_build(source.kb_id, mode=mode)
+                        spawn.assert_not_called()
+                        append.assert_not_called()
+                    else:
+                        service.trigger_graph_build(source.kb_id, mode=mode)
+                        if expected == "append":
+                            append.assert_called_once_with(source.kb_id)
+                            spawn.assert_not_called()
+                        else:
+                            spawn.assert_called_once_with(cfg, source.kb_id, **expected)
+                            append.assert_not_called()
+                    with db.connect(cfg.state_db) as con:
+                        self.assertEqual(bool(discovery.get_config(con, source.kb_id).get("graph_paused")), expected == "refuse")
+
+    def test_run_preserves_incremental_eligibility_checks(self) -> None:
+        from unittest import mock
+
+        from kb_server import service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source, cfg, _ = self._env(tmp, {"graph_enabled": True})
+            cfg.mirror_root = Path(tmp) / "mirror"
+            with db.connect(cfg.state_db) as con:
+                con.execute(
+                    "INSERT INTO graph_builds(graph_build_id, source_key, kb_id, source_collection, "
+                    "graph_version, status, started_at, finished_at) VALUES('g1',?,?,?,'v1','done',100,101)",
+                    (source.kb_id, source.kb_id, source.collection))
+                con.commit()
+            def gate(con, cfg, kb_id):
+                return {"source_root": "docs", "collection": source.collection}, {}, None
+            for reason in ("config_changed_needs_full_rebuild", "llm_not_configured"):
+                with self.subTest(reason=reason), \
+                        mock.patch.object(service, "settings", return_value=cfg), \
+                        mock.patch.object(service, "_graph_action_gate", side_effect=gate), \
+                        mock.patch("kb_pipeline.graph.build.evaluate_append", return_value={"due": False, "reason": reason}), \
+                        mock.patch.object(service, "_spawn_graph_build") as spawn:
+                    with self.assertRaises(ValueError) as error:
+                        service.trigger_graph_build(source.kb_id, mode="run")
+                    self.assertEqual(str(error.exception), service.APPEND_SKIP[reason])
+                    spawn.assert_not_called()
+            with mock.patch.object(service, "settings") as settings:
+                with self.assertRaisesRegex(ValueError, "Unknown graph build mode"):
+                    service.trigger_graph_build(source.kb_id, mode="invalid")
+                settings.assert_not_called()
 
 
 class SchemaVersionDeleteTests(unittest.TestCase):
@@ -1135,6 +1228,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             self.assertEqual(outcome, "new")
 
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             stub.embedding_base_url = "http://embedding.invalid/v1"
             limits = {"embedding_max_model_len": 4096, "effective_max_model_len": 4096,
@@ -1186,6 +1280,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                 discovery.enroll(con, mirror, "linked"); con.commit()
             shutil.rmtree(mirror / "linked"); (mirror / "linked").symlink_to(elsewhere, target_is_directory=True)
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             stub.mirror_root = mirror
             stub.qdrant_inactive_retention_days = 7
@@ -1230,6 +1325,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             (mirror / "目录没了").rmdir()
 
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             stub.mirror_root = mirror
             stub.qdrant_inactive_retention_days = 7
@@ -1294,10 +1390,11 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             state_db = root / "state.sqlite3"
             dbm.init_db(state_db)
             with dbm.connect(state_db) as con:
-                dbm.upsert_llm(con, name="vision", base_url="http://vision.invalid/v1", api_key="", model_id="synthetic-vision")
+                dbm.upsert_llm(con, name="vision", base_url="http://vision.invalid/v1", api_key="", model_id="synthetic-vision", multimodal=True)
             mirror = root / "mirror"
             (mirror / "新目录").mkdir(parents=True)
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             stub.mirror_root = mirror
             stub.corrections_dir = root / "corrections"
@@ -1309,9 +1406,9 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                       "overlap_rule": "", "live": False}
             with mock.patch.object(service, "settings", return_value=stub), \
                     mock.patch.object(service, "chunk_limits", return_value=limits), \
-                    mock.patch.object(service, "qdrant_client"), \
-                    mock.patch.object(service, "ensure_collection", return_value=True), \
-                    mock.patch.object(service.search_fts, "ensure_indices"), \
+                    mock.patch("kb_pipeline.storage.standard.vector_client"), \
+                    mock.patch("kb_pipeline.storage.standard.qdrant.ensure_collection", return_value=True), \
+                    mock.patch("kb_pipeline.search_fts.ensure_indices"), \
                     mock.patch.object(service, "kick_scan"), \
                     mock.patch.object(service, "kick_worker"):
                 # Bad draft: validate before enrolling; on failure nothing has happened
@@ -1367,6 +1464,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             (gw / "cache" / f"{short}.sqlite").write_bytes(b"x")
 
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             stub.runtime_dir = root / "rt"
             stub.graph_work_dir = gw
@@ -1478,6 +1576,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                     "VALUES('jq', ?, ?, 'parse', 'queued', 0, 0)", (s.kb_id, s.collection))
                 con.commit()
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             stub.mirror_root = mirror          # the directory existence check needs a real path
             stub.runtime_dir = root / "runtime"   # where the global build lock lives
@@ -1548,6 +1647,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             (gw / "work" / short / "v1" / "x").write_bytes(b"x")
 
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             stub.graph_work_dir = gw
             stub.runtime_dir = root
@@ -1602,6 +1702,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                     "started_at, finished_at) VALUES('g1', ?, ?, ?, 'v1', 'done', 100, 110)", (s.kb_id, s.kb_id, s.collection))
                 con.commit()
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             stub.graph_work_dir = root / "gw"
             stub.runtime_dir = root
@@ -1642,6 +1743,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             state_db = Path(tmp) / "state.sqlite3"
             dbm.init_db(state_db)
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
 
             def resp(status=200, content="OK", location=None):
@@ -1732,6 +1834,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             state_db = Path(tmp) / "state.sqlite3"
             dbm.init_db(state_db)
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
 
             def fake_resp(content, status=200):
@@ -1808,10 +1911,11 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
             with dbm.connect(state_db) as con:
                 dbm.upsert_llm(con, name="m", base_url="http://a:8000/v1", api_key="sk-old", model_id="x")
             stub = mock.Mock()
+            stub.storage_backend = "standard"
             stub.state_db = state_db
             seen: dict[str, Any] = {}
 
-            def probe(base_url, api_key, model_id, protocol="openai"):
+            def probe(base_url, api_key, model_id, protocol="openai", *, multimodal=False):
                 seen["probe_key"] = api_key
                 other = sqlite3.connect(str(state_db), timeout=0.2)        # another process writes meanwhile
                 try:
@@ -1927,7 +2031,8 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
                    "conditions": [{"name": "interval", "due": False, "interval_days": 14, "elapsed_days": 5.2, "last_finished_at": 1},
                                   {"name": "new_chunk_ratio", "due": False, "threshold": 0.2, "ratio": 0.007, "new_chunks": 76}]}
         cfg = SimpleNamespace(sources={"kb_x": SimpleNamespace(graph_enabled=True), "kb_off": SimpleNamespace(graph_enabled=False)})
-        with mock.patch.object(build_mod, "evaluate_rebuild", return_value=verdict) as ev:
+        with mock.patch.object(build_mod, "evaluate_rebuild", return_value=verdict) as ev, \
+                mock.patch.object(build_mod, "evaluate_append", return_value={"due": True}):
             first = service.rebuild_check_cached(cfg, "kb_x", now=1000.0)
             again = service.rebuild_check_cached(cfg, "kb_x", now=1030.0)
             later = service.rebuild_check_cached(cfg, "kb_x", now=1100.0)
@@ -1936,7 +2041,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
         self.assertEqual(ev.call_count, 2)                                   # reused within 60 s, recomputed after
         self.assertIs(first, again)
         self.assertEqual(later["conditions"][1]["new_chunks"], 76)
-        self.assertEqual(sorted(first), ["appends_since_full", "baseline_graph_version", "conditions", "due", "operator"])
+        self.assertEqual(sorted(first), ["appends_since_full", "baseline_graph_version", "conditions", "due", "manual_run", "operator"])
         self.assertNotIn("latest_graph_build_id", first)                      # only the fields the frontend draws
         with mock.patch.object(build_mod, "evaluate_rebuild", side_effect=RuntimeError("boom")):
             service._rebuild_check_cache.clear()
@@ -1944,7 +2049,7 @@ class ServiceFixRegressionTests(_CodexFinalTestsSupport, unittest.TestCase):
         self.assertEqual((broken["due"], broken["reason"]), (False, "check_failed"))   # a failed check must not sink overview
         service._rebuild_check_cache.clear()
         src = _repo_file("app/kb_server/service.py")
-        self.assertIn('entry["rebuild_check"] = rebuild_check_cached(cfg, entry["kb_id"])', src)
+        self.assertIn('entry["rebuild_check"] = rebuild_check_cached(cfg, entry["kb_id"], revision=revision)', src)
         html = _repo_file("app/kb_server/static/index.html")
         self.assertIn('自动重建·时间条件<span class="f-note" id="cfg-ri-progress" hidden></span>', html)      # the percentage sits after the label
         self.assertIn('自动重建·新增内容条件<span class="f-note" id="cfg-rp-progress" hidden></span>', html)

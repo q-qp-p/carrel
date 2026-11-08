@@ -323,6 +323,7 @@ def write_graph_vectors(
     base_version: str | None = None,
     embed_model: str = "",
     check_stop: Callable[[], None] | None = None,
+    storage: Any = None,
 ) -> dict[str, Any]:
     """reuse_from: {graph_type: previous version's collection name}, together with base_version; rows whose
     embedding text is unchanged in the previous version and were computed by the same embedding model reuse the
@@ -374,7 +375,8 @@ def write_graph_vectors(
             continue                  # no pages generated (view layer off, or no subjects / axis): no empty collection, the alias is optional
         collection = graph_collection_name(source_collection, graph_type, graph_version)
         layout = graph_vector_layout(graph_type)
-        status = ensure_graph_collection(q, collection, vector_size, layout=layout)
+        status = (storage.ensure(collection, vector_size, layout) if storage is not None
+                  else ensure_graph_collection(q, collection, vector_size, layout=layout))
         base_collection = (reuse_from or {}).get(graph_type) if base_version else None
         written = reused = embedded_rows = 0
         label = labels[graph_type]
@@ -389,7 +391,15 @@ def write_graph_vectors(
             vectors: list[Any] = [None] * len(chunk)
             if base_collection:
                 base_ids = [point_id_for(base_version, p["gr_id"]) for p in payloads]
-                base_points = _retrieve_base(q, base_collection, base_ids)
+                if storage is not None:
+                    try:
+                        base_points = {pid: (_base_embed_sha(str(pl.get("graph_type") or ""), pl), vec,
+                                             str(pl.get("embed_model") or ""))
+                                       for pid, (pl, vec) in storage.lookup(base_collection, base_ids).items()}
+                    except KeyError:
+                        base_points = None
+                else:
+                    base_points = _retrieve_base(q, base_collection, base_ids)
                 if base_points is None:
                     if check_stop is not None:
                         check_stop()            # the read may also fail because a stop landed in this call: do not re-embed everything then
@@ -429,12 +439,16 @@ def write_graph_vectors(
             expected_ids.update(str(p.id) for p in points)
             # writes to one collection are applied in submission order: waiting for the last batch is enough, once it
             # has landed so have the earlier ones; the point count is checked below
-            q.upsert(collection_name=collection, points=points, wait=start + batch >= len(rows))
+            if storage is not None:
+                storage.write(collection, [str(p.id) for p in points], vectors, payloads)
+            else:
+                q.upsert(collection_name=collection, points=points, wait=start + batch >= len(rows))
             written += len(points)
             if stage is not None:
                 stage(f"Writing vectors · {label} {written}/{len(rows)}" + (f" (reused {reused})" if reused else ""))
-        removed = _delete_points_not_in(q, collection, expected_ids)
-        actual = int(q.count(collection_name=collection, exact=True).count)
+        removed = (storage.delete_except(collection, expected_ids) if storage is not None
+                   else _delete_points_not_in(q, collection, expected_ids))
+        actual = storage.count(collection) if storage is not None else int(q.count(collection_name=collection, exact=True).count)
         if actual != len(rows):
             raise RuntimeError(f"Qdrant {collection} point count mismatch: actual={actual} expected={len(rows)}")
         summary["collections"][graph_type] = {

@@ -4,24 +4,32 @@
 
 ## 配置文件
 
-`deploy.sh` 会生成以下两个文件，后续运行时保留已有配置：
+容器部署使用以下两个配置文件，后续运行时保留已有配置：
 
 | 文件 | 用途 |
 |---|---|
-| `config/knowledge-base.env` | 应用路径、模型接口、凭据和处理参数 |
-| `deployment/compose/.env` | 容器镜像、解析后端策略、资源限制和本地模型服务 |
+| `data/config/knowledge-base.env` | 应用路径、模型接口、凭据和处理参数，由应用首次启动时生成 |
+| `deployment/compose/.env` | 容器镜像、存储版本、解析后端、资源限制和数据挂载，由 `deploy.sh` 准备 |
 
-从内置 VLM 部署升级时，会移除已退役容器的配置和对应的默认接口；自定义视觉接口继续保留。
+可参考 [应用配置模板](../config/knowledge-base.env.example) 和 [Compose 配置说明](../deployment/compose/README.zh-CN.md)。生成的文件包含凭据，已由 Git 忽略规则排除。容器将 `KB_ENV_FILE` 指向 `/data/config/knowledge-base.env`；原生部署读取 `config/knowledge-base.env`，不存在时兼容读取 `app/.env`，也可通过 `KB_ENV_FILE` 指定其他文件。
 
-可参考 [应用配置模板](../config/knowledge-base.env.example) 和 [Compose 配置说明](../deployment/compose/README.md)。生成的文件包含凭据，已由 Git 忽略规则排除。应用优先读取 `config/knowledge-base.env`，不存在时兼容读取 `app/.env`；也可通过 `KB_ENV_FILE` 指定其他文件。
+修改环境配置后，应重启应用容器。原生 systemd 部署则重启使用该配置的 `carrel-web.service`、`carrel-search.service`；新启动的扫描和 worker 进程会读取更新后的文件。正在处理的任务应先完成，再安排重启，详见 [运维说明](operations.zh-CN.md)。检索服务自己的 `KB_SEARCH_*` 参数是例外：服务每分钟重读一次配置文件，改参数、换令牌都不用重启；监听地址和端口仍需重启；控制台保存的模型接口配置也会在一分钟内刷新，服务进程环境里显式设置的参数优先于文件。
 
-修改环境配置后，应重启使用该配置的常驻应用服务。Linux 上，控制台和检索服务分别是 `carrel-web.service`、`carrel-search.service`；新启动的扫描和 worker 进程会读取更新后的文件。正在处理的任务应先完成，再安排重启，详见 [运维说明](operations.zh-CN.md)。检索服务自己的 `KB_SEARCH_*` 参数是例外：服务每分钟重读一次配置文件，改参数、换令牌都不用重启；监听地址和端口，以及文件里其他部分的参数（如各模型接口地址）仍需重启，服务进程环境里显式设置的参数优先于文件。
-
-如需运行本地向量和重排模型，运行 `./deploy.sh --with-local-models`。在控制台模型列表添加视觉接口，按知识库选择后保存解析配置。
+向量和重排模型独立部署，也可使用云端接口。在控制台的 LLM 区添加视觉接口，按知识库选择后保存解析配置。
 
 ## 模型接口
 
-默认部署启动存储服务和 MinerU。通过 `--with-local-models` 可额外启动四个文本／视觉向量与重排模型服务。
+系统设置按 **LLM、Embedding、Reranker** 分区。LLM 用于图片描述和建图；Embedding、Reranker 各自配置文本与视觉接口，填写 Base URL、Model ID 和可选 API Key，向量接口另设维度。文本向量必需，其他三项可单独停用。模型服务的部署和启停独立于这些接口配置。
+
+LLM 可配置**多模态**和**请求并发**。勾选多模态后，保存时会发送一张合成图片验证图片输入，收到非空且正常完成的文本回复才保存；不要求固定答案，不保留测试回复。未勾选时使用文本连通性检查。该模型会出现在知识库的图片描述选择列表中（当前使用 OpenAI 兼容协议）。并发范围为 1–256，新模型默认 1；图片描述和建图各自使用所选模型的并发上限，串行依赖的步骤仍按顺序执行。修改并发从新任务生效，不改变同时处理的文件数，也不使已有缓存失效。升级时保留已选多模态模型，并将旧环境并发迁入模型配置；两种用途共用一个模型时取两者较小值。此后在控制台修改。
+
+首次打开时显示环境文件中的配置。控制台保存的值写入状态数据库，优先于对应环境变量，供解析、建图和检索共同读取。每次保存会用合成文本或图片验证接口，不会发出知识库内容；验证失败保留原配置。密钥默认隐藏，点击眼睛可查看已保存或新输入的密钥；单纯查看不会改写密钥。留空保留原值，更换接口主机时需重新填写密钥；API 也支持显式清除凭据。
+
+解析 worker 在领取新任务后读取配置，新启动的建图任务同样读取；检索服务一分钟内刷新。保存不会触发重新解析或建图。批量大小和请求并发从新任务生效，不需要重建索引，也不会使图片向量缓存失效。修改其他向量配置需等待正在进行的解析、建图任务结束；已有索引时，控制台拒绝直接更换向量模型或维度。更换向量空间应先重新初始化相关索引，再使用新模型生成向量；更改维度还需重建知识库集合。重排模型更换不需要重建索引。
+
+文本和视觉向量均可配置**批量大小**（每次请求的条目数）和**请求并发**（单个任务同时发送的请求数），分别对应 `EMBEDDING_BATCH`、`EMBEDDING_CONCURRENCY`、`VISUAL_EMBEDDING_BATCH` 和 `VISUAL_EMBEDDING_CONCURRENCY`。文本设置用于文档和图谱入库，视觉设置用于图片向量化；不会改变同时解析的文件数。视觉批量使用多段独立对话，每张图片返回一个向量；只支持单段对话的接口应设置批量为 1。保存大于 1 的批量值时，会用两条合成输入验证接口，不会对所选批量和并发做容量测试。
+
+Standard 启动数据库容器和 MinerU；Light 只启动 MinerU，使用内嵌存储。两种版本的模型接口均独立配置。
 
 | 能力 | 配置 | 使用条件 |
 |---|---|---|
@@ -30,7 +38,7 @@
 | 图谱抽取与摘要 | 在控制台注册对话模型，再为知识库选择 | 启用建图时需要 |
 | 文本重排 | `RERANKER_BASE_URL`、`RERANKER_MODEL_ID`、`RERANKER_API_KEY` | 可选，未配置时使用检索融合顺序 |
 | 视觉向量 | `VISUAL_EMBEDDING_ENABLED`、`VISUAL_EMBEDDING_BASE_URL`、`VISUAL_EMBEDDING_MODEL_ID`、`VISUAL_EMBEDDING_DIM` 及其他 `VISUAL_EMBEDDING_*` | 可选，用于像素层面的检索；配套实现连接本地 vLLM |
-| 视觉重排服务 | `VISUAL_RERANKER_BASE_URL` | 可选的多模态重排；配置后自动参与检索融合 |
+| 视觉重排服务 | `VISUAL_RERANKER_BASE_URL`、`VISUAL_RERANKER_MODEL_ID`、`VISUAL_RERANKER_API_KEY` | 可选的多模态重排；配置后自动参与检索融合 |
 
 文本向量使用 OpenAI 兼容的 embeddings API，图片描述和建图模型使用兼容的 chat API。重排使用 `/v1/rerank`，视觉向量使用 vLLM 的多模态 pooling 请求格式；各接口需使用对应的请求格式。
 
@@ -42,7 +50,7 @@
 KB_LLM_COMPAT_OVERRIDES='[{"model_id":"custom-deployment","base_url":"https://models.example/v1","max_tokens_field":"max_completion_tokens","omit":["temperature","top_p"]}]'
 ```
 
-`max_tokens_field` 选择输出上限字段，`omit` 移除可选生成参数，`set` 指定参数值，例如 `{"reasoning_effort":"low"}` 或 `{"thinking":{"type":"disabled"}}`。匹配条目按顺序应用。修改后重启应用进程。连通性检查需要收到完整且包含 `OK` 的回复；HTTP 400 会显示为错误。
+`max_tokens_field` 选择输出上限字段，`omit` 移除可选生成参数，`set` 指定参数值，例如 `{"reasoning_effort":"low"}` 或 `{"thinking":{"type":"disabled"}}`。匹配条目按顺序应用。修改后重启应用进程。纯文本连通性检查需要收到完整且包含 `OK` 的回复；HTTP 400 会显示为错误。
 
 部署端使用不同的思考控制格式时，可配置 `"thinking_parameters":{"chat_template_kwargs":{"enable_thinking":false}}`。它只在图谱抽取等明确要求关闭思考的调用中替换思考参数，图片描述和连通性检查保留原有思考行为。需要对所有调用生效的参数使用 `set`。
 
@@ -50,7 +58,7 @@ KB_LLM_COMPAT_OVERRIDES='[{"model_id":"custom-deployment","base_url":"https://mo
 
 控制台模型卡片的“最大输入”（英文模式显示 **Max Input**）填写模型的输入 token 上限。标签抽取按文档和章节覆盖度自动选择样本，完整请求的估算输入控制在该值的 30% 以内。采样数量为只读字段，启动抽取前显示“尚未计算”；刷新或重新打开控制台后可以继续查看进度。
 
-使用配套模型服务时，先按 [本地模型部署说明](../deployment/compose/README.md#local-model-servers-profile-local-models) 下载权重，再运行 `./deploy.sh --with-local-models`。建图用的对话模型仍需在控制台单独配置。
+部署脚本不启动向量、重排或对话模型服务，也不下载其权重。详见[存储版本说明](storage.zh-CN.md#部署)。
 
 应在首次入库前选定向量模型和维度。模板中文本向量为 1024 维（`EMBEDDING_DIM`），视觉向量为 2048 维（`VISUAL_EMBEDDING_DIM`）。修改维度需要重建受影响的集合；更换模型时，即使维度相同，也需要重新生成资料向量。
 
@@ -76,7 +84,7 @@ KB_LLM_COMPAT_OVERRIDES='[{"model_id":"custom-deployment","base_url":"https://mo
 | 任务 | `KB_JOB_MAX_RETRIES`、`KB_JOB_RETRY_BASE_SECONDS`、`KB_JOB_RETRY_MAX_SECONDS`、`KB_PARSE_JOB_LEASE_SECONDS`、`KB_METADATA_JOB_LEASE_SECONDS` | 重试和任务租约。任务连不上所需的服务时退回队列，不计重试次数：先等基础间隔，之后每次加倍，不超过上限；这样退回达到 `KB_JOB_MAX_RETRIES` 次后记为失败 |
 | 保留期 | `QDRANT_INACTIVE_RETENTION_DAYS`、`KB_CACHE_ROTATION_KEEP`、`KB_LOG_ROTATION_KEEP_MONTHS`、`KB_BACKUP_KEEP` | 删除的撤销窗口（模板为 7 天）、缓存与日志轮换的保留份数、每夜状态备份的保留份数（7）。图片描述和视觉向量缓存不按时间过期，解析缓存里已经没有对应图片时，才由每周清理删除 |
 | 图谱 | `GRAPH_GC_KEEP_VERSIONS`、`GRAPH_GC_GRACE_SECONDS`、`QDRANT_GRAPH_COLLECTION_RETENTION_DAYS`、`NEO4J_GRAPH_RETENTION_DAYS`、`GRAPH_NEO4J_IMPORT_*` | 每库保留现行版加 N−1 个旧版，不看天数；最新一次暂停 / 失败的版本留给续跑，不删也不占名额（回退用 `kb graph rollback --source <key> --graph-version <旧版>`：目标必须是建成过的版本，集合点数要同建成时对得上，半截版本加 `--force` 才切）；两个保留天数键只对手工的按天清理命令生效；Neo4j 导入 |
-| 建图模型 | `KB_GRAPH_LLM_CONCURRENCY`、`KB_GRAPH_LLM_TIMEOUT`、`KB_GRAPH_CIRCUIT_FAILS` | 并发、超时与熔断 |
+| 建图模型 | `KB_GRAPH_LLM_TIMEOUT`、`KB_GRAPH_CIRCUIT_FAILS` | 超时与熔断；并发在 LLM 配置中设置 |
 | 控制台 | `KB_WEB_HOST`、`KB_WEB_PORT`、`KB_WEB_TOKEN`、`KB_CONSOLE_SERVICES` | 默认 `127.0.0.1:9800`，默认管理 `database,mineru` 服务组 |
 | 检索 | `KB_SEARCH_HOST`、`KB_SEARCH_PORT`、`KB_SEARCH_TOKEN`、`KB_SEARCH_TOP_K`、`KB_SEARCH_RERANK`、`KB_SEARCH_CONTEXT_TOKENS`、`KB_SEARCH_REQUEST_BUDGET`、`KB_SEARCH_ROUTE_MAX_KBS`、`KB_SEARCH_ROUTE_GAP`、`KB_SEARCH_ROUTE_FLOOR` 及其他 `KB_SEARCH_*` | 监听地址与令牌、返回数量、重排、上下文预算、整次请求的时间预算（应小于调用方的超时）；自动路由会把证据分数与最高分相差不超过 GAP 的知识库一起查（最多 MAX_KBS 个），全部低于 FLOOR 时标记结果偏弱 |
 

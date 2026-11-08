@@ -64,7 +64,7 @@ def _overview(driver: Any, kb_id: str) -> tuple[dict[str, Any], str | None]:
     return overview(stats), None
 
 
-def build_catalog(settings: Settings, q: Any, driver: Any = None) -> list[dict[str, Any]]:
+def build_catalog(settings: Settings, q: Any, driver: Any = None, *, store: Any = None) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     down: str | None = None         # main store unreachable or timing out: the remaining knowledge bases are not tried, every attempt would wait for the timeout
     with db.connect(settings.state_db) as con:
@@ -74,7 +74,7 @@ def build_catalog(settings: Settings, q: Any, driver: Any = None) -> list[dict[s
             chunks, entity_target, failed = 0, None, down
             if failed is None:
                 try:
-                    chunks = int(q.count(collection_name=source.collection, count_filter=ACTIVE_FILTER, exact=True).count)
+                    chunks = (store.chunks.active_count(source.collection) if store.chunks.exists(source.collection) else 0) if store is not None else int(q.count(collection_name=source.collection, count_filter=ACTIVE_FILTER, exact=True).count)
                 except Exception as exc:
                     status = getattr(exc, "status_code", None)          # with a status code the main store answered with an error that concerns only this knowledge base
                     if status != 404:                                    # 404 means the collection does not exist yet (knowledge base just opened): really 0 chunks
@@ -84,7 +84,7 @@ def build_catalog(settings: Settings, q: Any, driver: Any = None) -> list[dict[s
                                    (source.collection,)).fetchone()[0])
             if failed is None:
                 try:
-                    targets = graph_alias_targets(q, source.collection, ("entity",))
+                    targets = store.graph.alias_targets(source.collection) if store is not None else graph_alias_targets(q, source.collection, ("entity",))
                     entity_target = targets.get(graph_collection_alias(source.collection, "entity"))
                 except Exception as exc:
                     failed = type(exc).__name__
@@ -105,9 +105,9 @@ def build_catalog(settings: Settings, q: Any, driver: Any = None) -> list[dict[s
                 # chunks that cannot be counted and a graph alias that cannot be seen mean "unknown", not "0 chunks,
                 # no graph": whether there is a graph is recorded as unknown, and search still tries the graph channel
                 entries[-1].update({"chunks": None, "has_graph": None, "degraded": f"qdrant: {failed}"})
-            elif entries[-1]["has_graph"] and driver is not None:
+            elif entries[-1]["has_graph"] and (driver is not None or store is not None):
                 # 有图的库带一份概览:类型(上层类、实体数、文档数)、常见关系及其两端、时间跨度、核心主体
-                view, err = _overview(driver, kb_id)
+                view, err = (_light_overview(store, kb_id), None) if store is not None else _overview(driver, kb_id)
                 if view:
                     entries[-1]["overview"] = view
                 if err:
@@ -226,3 +226,8 @@ def route_explicit(explicit: list[str], entries: list[dict[str, Any]]) -> dict[s
     """The caller named the knowledge bases: use them as given, listing unrecognised ones in unknown."""
     known = {e["kb_id"] for e in entries}
     return {"mode": "explicit", "chosen": [k for k in explicit if k in known], "unknown": [k for k in explicit if k not in known], "scores": {}}
+
+
+def _light_overview(store, kb_id):
+    from kb_pipeline.graph.stats import overview
+    return overview(store.graph.stats(kb_id)[1])

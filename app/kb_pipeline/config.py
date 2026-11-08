@@ -101,6 +101,12 @@ class Settings:
     # be hosted APIs that nothing on this box can restart.
     console_services: tuple[str, ...]
     sources: dict[str, KBSource]
+    visual_reranker_model_id: str = ""
+    visual_reranker_api_key: str = ""
+    embedding_concurrency: int = 1
+    visual_embedding_batch: int = 1
+    storage_backend: str = "standard"
+    storage_root: Path | None = None
 
     @property
     def vector_layout(self) -> VectorLayout:
@@ -139,7 +145,15 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
     sources: dict[str, KBSource] = enrolled_sources(state_db, mirror_root)
     sources.update(_load_extra_sources(mirror_root))
 
-    return Settings(
+    storage_backend = os.getenv("KB_STORAGE_BACKEND", "standard").strip().lower()
+    if storage_backend not in ("standard", "light"):
+        raise ValueError("KB_STORAGE_BACKEND must be standard or light")
+    mode_file = runtime_dir / "deployment-mode"
+    if mode_file.exists() and mode_file.read_text().strip() != storage_backend:
+        raise ValueError("Storage edition is fixed for this deployment directory")
+    settings = Settings(
+        storage_backend=storage_backend,
+        storage_root=Path(os.getenv("KB_STORAGE_ROOT", str(runtime_dir / "storage"))).expanduser(),
         env_file=selected_env,
         mirror_root=mirror_root,
         state_db=state_db,
@@ -156,6 +170,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         embedding_model_id=os.getenv("EMBEDDING_MODEL_ID", "qwen3-embedding-0.6b"),
         embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
         embedding_batch=int(os.getenv("EMBEDDING_BATCH", "10")),
+        embedding_concurrency=int(os.getenv("EMBEDDING_CONCURRENCY", "1")),
         embedding_retry=int(os.getenv("EMBEDDING_RETRY", "5")),
         embedding_sleep_seconds=float(os.getenv("EMBEDDING_SLEEP_SECONDS", "0.1")),
         embedding_api_key=os.getenv("EMBEDDING_API_KEY", ""),
@@ -166,12 +181,15 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         visual_embedding_dim=int(os.getenv("VISUAL_EMBEDDING_DIM", "2048")),
         visual_embedding_instruction=os.getenv("VISUAL_EMBEDDING_INSTRUCTION", "Represent the user's input."),
         visual_embedding_concurrency=int(os.getenv("VISUAL_EMBEDDING_CONCURRENCY", "2")),
+        visual_embedding_batch=int(os.getenv("VISUAL_EMBEDDING_BATCH", "1")),
         visual_embedding_retry=int(os.getenv("VISUAL_EMBEDDING_RETRY", "5")),
         visual_embedding_timeout_seconds=float(os.getenv("VISUAL_EMBEDDING_TIMEOUT_SECONDS", "300")),
         reranker_base_url=os.getenv("RERANKER_BASE_URL", "http://127.0.0.1:8102/v1").strip(),
         reranker_model_id=os.getenv("RERANKER_MODEL_ID", "").strip(),
         reranker_api_key=os.getenv("RERANKER_API_KEY", "").strip(),
         visual_reranker_base_url=os.getenv("VISUAL_RERANKER_BASE_URL", "http://127.0.0.1:8104/v1").strip(),
+        visual_reranker_model_id=os.getenv("VISUAL_RERANKER_MODEL_ID", "").strip(),
+        visual_reranker_api_key=os.getenv("VISUAL_RERANKER_API_KEY", "").strip(),
         image_max_pixels=int(os.getenv("KB_IMAGE_MAX_PIXELS", "3686400")),
         vlm_concurrency=int(os.getenv("VLM_CONCURRENCY") or "1"),
         # Qwen3-VL recommends top_p 0.8 for vision tasks; the temperature is
@@ -217,7 +235,7 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         neo4j_uri=os.getenv("NEO4J_URI", "bolt://127.0.0.1:7687"),
         neo4j_user=os.getenv("NEO4J_USER", "neo4j"),
         neo4j_password=neo4j_password,
-        graph_neo4j_import_after_build=env_bool("GRAPH_NEO4J_IMPORT_AFTER_BUILD", True),
+        graph_neo4j_import_after_build=(storage_backend == "light" or env_bool("GRAPH_NEO4J_IMPORT_AFTER_BUILD", True)),
         # Keep the previous version besides the current one: a quality problem found after release can still
         # be switched back (the rollback on a failed switch only protects the moment of release). It was once
         # 1 version only (morning of 2026-09-06); the Codex review advised keeping at least one accepted
@@ -228,6 +246,8 @@ def load_settings(env_file: str | Path | None = None) -> Settings:
         console_services=parse_console_services(os.getenv("KB_CONSOLE_SERVICES")),
         sources=sources,
     )
+    from .model_endpoints import apply_overrides
+    return apply_overrides(settings)
 
 
 # Console service rows, in display order. "database" bundles Qdrant, OpenSearch

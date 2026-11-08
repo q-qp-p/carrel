@@ -994,6 +994,63 @@ class MaintenanceDeferPolicyTests(unittest.TestCase):
             self.assertIn("maint_defer_clear", text)
             self.assertNotIn("exit 75", text, f"{name} 里还留着自己的 exit 75")
 
+    def test_light_launchers_run_without_qdrant(self) -> None:
+        for script, args in (
+            ("kb-pipeline-worker-once.sh", ()),
+            ("kb-graph-rebuild-check.sh", ()),
+            ("kb-cleanup.sh", ("parse-assets-gc",)),
+        ):
+            for from_file in (False, True):
+                with self.subTest(script=script, from_file=from_file), tempfile.TemporaryDirectory() as tmpdir:
+                    tmp = Path(tmpdir)
+                    self._fake_repo(tmp, 0)
+                    py = tmp / "app/.venv/bin/python"
+                    py.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$KB_LOCAL_BASE_DIR/cli.calls"\necho no-job\n', encoding="utf-8")
+                    self._fake_curl(tmp, 22)
+                    curl = tmp / "bin/curl"
+                    curl.write_text('#!/bin/sh\ntouch "$KB_LOCAL_BASE_DIR/curl.called"\nexit 22\n', encoding="utf-8")
+                    env = {"QDRANT_URL": "http://127.0.0.1:1", "KB_QDRANT_HEALTH_TIMEOUT_SECONDS": "1", "TMPDIR": str(tmp)}
+                    if from_file:
+                        config = tmp / "config/knowledge-base.env"
+                        config.parent.mkdir()
+                        config.write_text("KB_STORAGE_BACKEND='light'\n", encoding="utf-8")
+                    else:
+                        env["KB_STORAGE_BACKEND"] = "light"
+                    result = self._run(tmp, script, *args, **env)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertTrue((tmp / "cli.calls").exists(), result.stdout + result.stderr)
+                    self.assertFalse((tmp / "curl.called").exists())
+                    self.assertFalse(list(tmp.rglob("*.defers")))
+                    self.assertFalse((tmp / "runtime/state/kb_worker.lock.d").exists())
+
+    def test_standard_worker_keeps_unavailable_qdrant_guard(self) -> None:
+        for backend in (None, "standard"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                self._fake_repo(tmp, 1)
+                env = {"QDRANT_URL": "http://127.0.0.1:1", "KB_QDRANT_HEALTH_TIMEOUT_SECONDS": "1"}
+                if backend is not None:
+                    env["KB_STORAGE_BACKEND"] = backend
+                result = self._run(tmp, "kb-pipeline-worker-once.sh", **env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Qdrant unavailable", result.stdout)
+                self.assertNotIn("KB worker loop start", result.stdout)
+
+    def test_maintenance_backend_override_and_invalid_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            self._fake_repo(tmp, 1)
+            self._fake_curl(tmp, 22)
+            config = tmp / "config/knowledge-base.env"
+            config.parent.mkdir()
+            config.write_text('KB_STORAGE_BACKEND="light"\n', encoding="utf-8")
+            # Light storage errors still surface; an exported Standard mode retains its wait policy.
+            self.assertEqual(self._run(tmp, "kb-graph-rebuild-check.sh").returncode, 1)
+            self.assertEqual(self._run(tmp, "kb-graph-rebuild-check.sh", KB_STORAGE_BACKEND="standard").returncode, 0)
+            result = self._run(tmp, "kb-graph-rebuild-check.sh", KB_STORAGE_BACKEND="unknown")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Unsupported KB_STORAGE_BACKEND", result.stderr)
+
     def test_qdrant_not_ready_is_a_deferral_not_a_failure(self) -> None:
         """2026-09-06: when Qdrant could not be reached, the unit's ExecStartPre used to exit 75 directly,
         painting the unit failed every round while the services were deliberately stopped. The wait now lives in
@@ -1281,7 +1338,7 @@ class DeploymentFileTests(unittest.TestCase):
         compose = _repo_file("deployment/compose/docker-compose.yml")
         example = self._pairs(_repo_file("deployment/compose/.env.example"))
         defaults = re.findall(r"\$\{(\w+):-([^}]*)\}", compose)
-        self.assertGreater(len(defaults), 80)
+        self.assertGreater(len(defaults), 40)
         self.assertEqual({key: value for key, value in defaults if example.get(key, value) != value}, {})
         # COMPOSE_FILE / COMPOSE_PROFILES are read by docker compose itself, not through ${...}. The README of this
         # compose directory reports no GPU share total to compare against: the parser's share is derived from the
@@ -1301,27 +1358,22 @@ class DeploymentFileTests(unittest.TestCase):
     def test_every_container_rotates_its_log(self) -> None:
         compose = _repo_file("deployment/compose/docker-compose.yml")
         head, body = compose.split("\nservices:\n", 1)
-        common = head.split("x-vllm-common:", 1)[1].split("\nx-", 1)[0]
         self.assertIn('max-size: "50m"', head)
-        self.assertIn("logging: *default-logging", common)
         blocks = re.split(r"(?m)^  ([\w.-]+):\n", body.split("\nnetworks:\n", 1)[0])
         services = dict(zip(blocks[1::2], blocks[2::2]))
-        self.assertEqual(set(services), {"embedding", "reranker", "vl-embedding", "vl-reranker", "mineru", "qdrant", "neo4j", "opensearch"})
+        self.assertEqual(set(services), {"app", "mineru", "qdrant", "neo4j", "opensearch"})
         for name, block in services.items():
             self.assertTrue("logging: *default-logging" in block or "<<: *vllm-common" in block, name)
 
-    def test_search_model_servers_are_batch_invariant(self) -> None:
-        """The three model servers a search calls (embedding, reranker, vl-embedding) run in batch-invariant
-        mode, so the same query ranks the same way every time; the generative ones (vlm, the parser) do not."""
-        compose = _repo_file("deployment/compose/docker-compose.yml")
-        head, body = compose.split("\nservices:\n", 1)
-        anchor = head.split("x-vllm-deterministic: &vllm-deterministic", 1)[1].split("\nx-", 1)[0]
-        self.assertIn("<<: *vllm-environment", anchor)
-        self.assertIn('VLLM_BATCH_INVARIANT: "${VLLM_BATCH_INVARIANT:-1}"', anchor)
-        blocks = re.split(r"(?m)^  ([\w.-]+):\n", body.split("\nnetworks:\n", 1)[0])
-        services = dict(zip(blocks[1::2], blocks[2::2]))
-        self.assertEqual({name for name, block in services.items() if "*vllm-deterministic" in block},
-                         {"embedding", "reranker", "vl-embedding"})
+    def test_models_are_external_in_both_editions(self) -> None:
+        import yaml
+        compose = yaml.safe_load(_repo_file("deployment/compose/docker-compose.yml"))
+        services = compose["services"]
+        self.assertEqual(set(services), {"app", "mineru", "qdrant", "neo4j", "opensearch"})
+        for name in ("qdrant", "neo4j", "opensearch"):
+            self.assertEqual(services[name]["profiles"], ["standard"])
+        self.assertNotIn("profiles", services["mineru"])
+        self.assertNotIn("VLLM_BATCH_INVARIANT", _repo_file("deployment/compose/.env.example"))
 
 
 class DependencyDeclarationTests(unittest.TestCase):
@@ -1332,12 +1384,12 @@ class DependencyDeclarationTests(unittest.TestCase):
     it, so it is declared there and never among the required dependencies."""
 
     APP = Path(__file__).resolve().parents[1]
-    PACKAGES = ("kb_pipeline", "kb_server", "kb_search")
+    PACKAGES = ("kb_pipeline", "kb_server", "kb_search", "kb_runtime")
     # import names that differ from the distribution name
     DISTRIBUTION = {"yaml": "pyyaml", "pil": "pillow", "opensearchpy": "opensearch-py", "fitz": "pymupdf"}
     TRANSITIVE = {"numpy", "pydantic", "httpx"}   # brought in by qdrant-client / fastapi / openai, versions follow theirs
     NOT_IMPORTED = {"tree-sitter"}            # runtime of the grammar package; the code only imports tree_sitter_language_pack
-    OPTIONAL = {"pymupdf"}                    # optional extras: guarded imports, the feature degrades without them
+    OPTIONAL = {"pymupdf", "lancedb", "duckdb", "pyarrow"}  # imported only for the selected optional feature
 
     def _imported(self) -> set[str]:
         import ast
@@ -1366,7 +1418,7 @@ class DependencyDeclarationTests(unittest.TestCase):
         imported, declared, optional = self._imported(), self._declared(), self._declared(optional=True)
         self.assertEqual(imported - declared - optional - self.TRANSITIVE, set(), "used by the code, not declared in pyproject")
         self.assertEqual(declared - imported - self.NOT_IMPORTED, set(), "declared in pyproject, used by no code")
-        self.assertEqual(optional, self.OPTIONAL)              # the optional extra is PyMuPDF ...
+        self.assertEqual(optional, self.OPTIONAL)              # all optional feature dependencies ...
         self.assertEqual(optional & declared, set())           # ... never a required dependency ...
         self.assertLessEqual(optional, imported)               # ... and really used by the code
 
@@ -1382,25 +1434,32 @@ class DependencyDeclarationTests(unittest.TestCase):
 
     def test_lock_files_pin_every_declared_dependency_inside_its_range(self) -> None:
         """requirements.lock is the exact set the suite was run against: every required dependency is in it with a
-        version inside its declared range, pytest too, and nothing but name==version lines. The optional pdf-images
-        extra (AGPL) has its own requirements-pdf-images.lock and never appears in the main one, so a plain install
-        stays free of it. Every declared range carries an upper bound."""
+        version inside its declared range, pytest too, and nothing but name==version lines. Each optional extra
+        has its own requirements-<extra>.lock and its declared dependencies never appear in the main one.
+        Every declared range carries an upper bound."""
         import tomllib
 
         from packaging.requirements import Requirement
         from packaging.version import Version
 
         project = tomllib.loads((self.APP / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-        main, extra = self._pins("requirements.lock"), self._pins("requirements-pdf-images.lock")
-        optional = [dep for group in project.get("optional-dependencies", {}).values() for dep in group]
-        for dep, pins in [(dep, main) for dep in project["dependencies"]] + [(dep, extra) for dep in optional]:
+        main = self._pins("requirements.lock")
+        optional = []
+        checks = [(dep, main) for dep in project["dependencies"]]
+        for name, group in project.get("optional-dependencies", {}).items():
+            pins = self._pins(f"requirements-{name}.lock")
+            checks.extend((dep, pins) for dep in group)
+            optional.extend(group)
+            for package in set(pins) & set(main):
+                self.assertEqual(pins[package], main[package], f"{name}: conflicting shared dependency {package}")
+        for dep, pins in checks:
             req = Requirement(dep)
             name = req.name.lower().replace("_", "-")
             self.assertIn(name, pins, dep)
             self.assertTrue(req.specifier.contains(Version(pins[name]), prereleases=True), f"{dep} is locked at {pins[name]}")
             self.assertTrue(any(op in ("<", "<=", "==", "~=") for op in (spec.operator for spec in req.specifier)), f"{dep} has no upper bound")
         self.assertIn("pytest", main)
-        self.assertEqual({Requirement(dep).name.lower() for dep in optional} & set(main), set())   # the AGPL extra stays out of the main lock
+        self.assertEqual({Requirement(dep).name.lower() for dep in optional} & set(main), set())
 
 
 class OpsFixRegressionTests(_CodexAudit20260906TestsSupport, _CodexFinalTestsSupport, unittest.TestCase):

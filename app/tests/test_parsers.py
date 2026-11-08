@@ -3400,7 +3400,7 @@ class PdfTextLayerTests(unittest.TestCase):
             db.init_db(state_db)
             with db.connect(state_db) as con:
                 db.upsert_llm(con, name="vision-a", base_url="http://vision.invalid/v1",
-                              api_key="", model_id="synthetic-vision")
+                              api_key="", model_id="synthetic-vision", multimodal=True)
             settings = SimpleNamespace(max_file_bytes=0, job_max_retries=5, cache_dir=Path(tmp) / "cache", mineru_url="http://x",
                                        state_db=state_db, vlm_concurrency=1, vlm_temperature=0.1,
                                        vlm_top_p=0.8, vlm_max_tokens=64, vlm_structured_output=True, image_max_pixels=1,

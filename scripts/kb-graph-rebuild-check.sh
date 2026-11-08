@@ -6,8 +6,8 @@ set -euo pipefail
 # KB_LOCAL_BASE_DIR (systemd injects it, interactive shells usually do not).
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${KB_LOCAL_BASE_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
-APP_DIR="$BASE_DIR/app"
-PY="$APP_DIR/.venv/bin/python"
+APP_DIR="${KB_APP_DIR:-$BASE_DIR/app}"
+PY="${KB_PYTHON:-$APP_DIR/.venv/bin/python}"
 if [[ -n "${KB_ENV_FILE:-}" ]]; then
   ENV_FILE="$KB_ENV_FILE"
 elif [[ -f "$BASE_DIR/config/knowledge-base.env" ]]; then

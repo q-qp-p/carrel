@@ -558,7 +558,7 @@ class ConfigLoadingTests(unittest.TestCase):
         for name in ("vlm_base_url", "vlm_model_id", "vlm_api_key"):
             self.assertFalse(hasattr(cfg, name))
 
-    def test_defaults_match_the_example_file_and_bundled_models(self) -> None:
+    def test_defaults_match_the_example_file_and_external_models(self) -> None:
         cfg, example = self._load(), self._example()
         for key, name in (("EMBEDDING_BASE_URL", "embedding_base_url"), ("EMBEDDING_MODEL_ID", "embedding_model_id"),
                           ("VISUAL_EMBEDDING_BASE_URL", "visual_embedding_base_url"),
@@ -572,7 +572,7 @@ class ConfigLoadingTests(unittest.TestCase):
             self.assertIn(example[key], ("", getattr(cfg, name)), key)
         self.assertTrue({"VLM_BASE_URL", "VLM_MODEL_ID", "VLM_API_KEY"}.isdisjoint(example))
         served = set(re.findall(r"--served-model-name\n\s+- (\S+)", _repo_file("deployment/compose/docker-compose.yml")))
-        self.assertLessEqual({cfg.embedding_model_id, cfg.visual_embedding_model_id}, served)
+        self.assertEqual(served, set())  # Model endpoints are configured independently.
 
     def test_legacy_vlm_variable_names_are_not_read(self) -> None:
         # The names stand in for the old fallback variables, which this tree no longer carries
@@ -779,7 +779,7 @@ class RestoreProjectionTests(unittest.TestCase):
             self.assertEqual(calls, [])                                  # nothing to restore, nothing touched
         worker = _repo_file("app/kb_pipeline/pipeline/worker.py")
         self.assertIn("db.chunk_point_ids_to_restore(", worker)
-        self.assertIn("reactivate_file_metadata(q, file_row, point_ids=restore_ids)", worker)
+        self.assertIn("store.chunks.reactivate(file_row, point_ids=restore_ids)", worker)
         self.assertIn("db.mark_chunks_deleted(", worker)
 
     def _reactivate_job(self, con, settings):
@@ -816,8 +816,8 @@ class RestoreProjectionTests(unittest.TestCase):
                 db.mark_chunks_deleted(con, fid)
                 con.commit()
 
-                with mock.patch.object(worker_mod, "qdrant_client"), \
-                        mock.patch.object(worker_mod, "reactivate_file_metadata") as reactivated, \
+                with mock.patch("kb_pipeline.storage.standard.vector_client"), \
+                        mock.patch("kb_pipeline.storage.standard.qdrant.reactivate_file_metadata") as reactivated, \
                         mock.patch.object(worker_mod, "_sync_fts_doc"):
                     result = worker_mod.run_once(con, settings=settings)
                 statuses = [r[0] for r in con.execute(
@@ -857,9 +857,9 @@ class RestoreProjectionTests(unittest.TestCase):
                 db.mark_chunks_inactive(con, fid)      # the deactivated points never existed / were GC'd
                 con.commit()
 
-                with mock.patch.object(worker_mod, "qdrant_client"), \
-                        mock.patch.object(worker_mod, "file_version_point_count", return_value=0), \
-                        mock.patch.object(worker_mod, "reactivate_file_metadata"), \
+                with mock.patch("kb_pipeline.storage.standard.vector_client"), \
+                        mock.patch("kb_pipeline.storage.standard.qdrant.file_version_point_count", return_value=0), \
+                        mock.patch("kb_pipeline.storage.standard.qdrant.reactivate_file_metadata"), \
                         mock.patch.object(worker_mod, "_sync_fts_doc"):
                     worker_mod.run_once(con, settings=settings)
                 statuses = [r[0] for r in con.execute(
@@ -918,8 +918,8 @@ class ChunkDiagnosisSurvivesMetadataUpdateTests(unittest.TestCase):
                                file_key=file.file_key, job_type="metadata_update", payload={"reason": "path/name changed"},
                                dedupe_key=f"metadata_update:{fid}:x")
                 con.commit()
-                with mock.patch.object(worker_mod, "qdrant_client"), \
-                        mock.patch.object(worker_mod, "update_file_metadata") as updated, \
+                with mock.patch("kb_pipeline.storage.standard.vector_client"), \
+                        mock.patch("kb_pipeline.storage.standard.qdrant.update_file_metadata") as updated, \
                         mock.patch.object(worker_mod, "_sync_fts_doc"):
                     result = worker_mod.run_once(con, settings=settings)
                 self.assertTrue(result.startswith("metadata-done"))

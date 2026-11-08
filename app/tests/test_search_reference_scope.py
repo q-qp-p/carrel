@@ -1,4 +1,6 @@
 """Source and graph versions stay bound across follow-up calls."""
+
+from storage_fakes import storage_runtime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import sqlite3
@@ -63,7 +65,7 @@ def test_images_and_crops_apply_the_same_document_scope(tmp_path):
     pid = str(uuid.uuid4())
     q = Mock()
     q.retrieve.return_value = [SimpleNamespace(payload={"is_active": True, "rel_path": "report.pdf", "visual_ref": "figure.png"})]
-    with patch.object(service, "runtime", return_value=(settings, None, q)):
+    with patch.object(service, "runtime", return_value=storage_runtime(settings, None, q)):
         for fn, args in [(service.image, ()), (service.crop, ([0, 0, .5, .5],))]:
             with pytest.raises(KeyError, match="scope"):
                 fn("sample", pid, *args)

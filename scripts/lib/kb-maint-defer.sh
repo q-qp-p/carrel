@@ -17,6 +17,26 @@
 
 : "${BASE_DIR:?kb-maint-defer.sh: the caller must set BASE_DIR}"
 
+# Interactive launchers do not always load the systemd EnvironmentFile.
+maint_storage_backend() {
+  local backend="${KB_STORAGE_BACKEND:-}"
+  if [[ -z "$backend" && -n "${ENV_FILE:-}" && -f "$ENV_FILE" ]]; then
+    backend="$(awk -F= '
+      /^[[:space:]]*(export[[:space:]]+)?KB_STORAGE_BACKEND[[:space:]]*=/ {
+        v = substr($0, index($0, "=") + 1)
+        sub(/[[:space:]]+#.*$/, "", v)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        gsub(/^["\047]|["\047]$/, "", v)
+        print v
+      }' "$ENV_FILE" | tail -n 1)"
+  fi
+  backend="$(printf '%s' "${backend:-standard}" | tr '[:upper:]' '[:lower:]')"
+  case "$backend" in
+    light|standard) printf '%s\n' "$backend" ;;
+    *) echo "Unsupported KB_STORAGE_BACKEND: $backend" >&2; return 2 ;;
+  esac
+}
+
 _maint_defer_file() {   # $1 = job name
   local dir="${KB_MAINT_STATE_DIR:-$BASE_DIR/runtime/state/maintenance}"
   mkdir -p "$dir"
@@ -55,7 +75,10 @@ maint_defer_give_up() {
 # are down" is a normal yield just like "hit the ingestion peak", not a fault (2026-09-06).
 # $1 = job name (counter file name), $2 = human-readable description (goes into the log)
 maint_wait_qdrant_or_defer() {
-  local task="$1" what="$2" url rounds delay i
+  local task="$1" what="$2" url rounds delay i backend
+  backend="$(maint_storage_backend)" || return $?
+  # Light jobs access embedded storage directly; Qdrant is not a dependency.
+  [[ "$backend" == "light" ]] && return 0
   url="${QDRANT_URL:-}"
   if [[ -z "$url" && -n "${ENV_FILE:-}" && -f "$ENV_FILE" ]]; then
     # not loaded into the environment by systemd (interactive run, the qdrant-gc unit): read it from the env file

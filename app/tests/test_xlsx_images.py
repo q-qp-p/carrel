@@ -107,7 +107,7 @@ def test_media_uses_selected_model_and_preserves_table_output(tmp_path):
     def caption(jobs,**kw):
         assert kw['model_id']=='selected-model'
         return {bid:{'summary':'Gate diagram','facts':['Gate B requires check A.'],'decorative':False} for bid,*rest in jobs}
-    with patch.object(parse_job,'_vlm_endpoint',return_value=('url','key','selected-model')), patch.object(visual_blocks,'caption_images_parallel',caption):
+    with patch.object(parse_job,'_vlm_endpoint',return_value=('url','key','selected-model',2)), patch.object(visual_blocks,'caption_images_parallel',caption):
         bs=parse_job._parse_blocks(cfg,source,path,tmp_path/'cache','table-native-v1',{})
     assert [(b.block_id,b.text) for b in bs if b.block_type!='image']==[(b.block_id,b.text) for b in before]
     image=next(b for b in bs if b.block_type=='image')

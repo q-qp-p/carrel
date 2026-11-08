@@ -373,7 +373,7 @@ def collapse_duplicate_facts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, question: str, *, limit: int = 12,
                per_token: int = LEXICAL_PER_TOKEN, window: dict[str, str] | None = None,
-               scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+               scope: dict[str, Any] | None = None, native: Any = None) -> list[dict[str, Any]]:
     """限定事实种子:稠密检索(属性侧 / 值侧 / 整句)+ 记号精确匹配(主体 / 符号 / 属性)+ 时间窗加权 + 贪心覆盖。
     按时间口径筛;默认保留历史声明,仅排除显式文档治理范围。
     集合不存在(旧图)就返回空。"""
@@ -385,7 +385,7 @@ def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, questio
     scope = scope or query_scope()
     flt_status = relation_filter(scope)
     try:
-        rows = _spec_dense_rows(q, spec_collection, vector, limit, flt_status) if vector is not None else []
+        rows = (native.spec_dense(vector, limit, scope) if native is not None else _spec_dense_rows(q, spec_collection, vector, limit, flt_status)) if vector is not None else []
     except Exception:
         return []
     seeds: dict[str, dict[str, Any]] = {}
@@ -401,12 +401,15 @@ def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, questio
                                 qm.FieldCondition(key="property", match=qm.MatchAny(any=variants))],
                         must=flt_status.must)
         try:
-            points, _ = q.scroll(collection_name=spec_collection, scroll_filter=flt, limit=per_token * 4,
-                                 with_payload=True, with_vectors=False)
+            if native is not None:
+                found = native.lexical_facts(variants, per_token * 4, scope)
+            else:
+                points, _ = q.scroll(collection_name=spec_collection, scroll_filter=flt, limit=per_token * 4,
+                                     with_payload=True, with_vectors=False)
+                found = [{**dict(p.payload or {}), "_point_id": str(p.id)} for p in points]
         except Exception:
             break
-        for p in points:
-            payload = dict(p.payload or {})
+        for payload in found:
             sid = str(payload.get("gr_id") or "")
             if not sid or not in_scope(payload, scope):
                 continue
@@ -414,7 +417,6 @@ def spec_seeds(q: Any, spec_collection: str, vector: list[float] | None, questio
             cur = seeds.get(sid)
             if cur is None:
                 payload["_score"] = score
-                payload["_point_id"] = str(p.id)
                 payload["_via"] = "lexical"
                 payload["_token"] = tok
                 seeds[sid] = payload
@@ -467,11 +469,11 @@ PAGE_EVIDENCE_MIN_SCORE = 0.6
 
 
 def page_seeds(q: Any, page_collection: str, vector: list[float], question: str, *,
-               limit: int = PAGE_SEED_LIMIT) -> list[dict[str, Any]]:
+               limit: int = PAGE_SEED_LIMIT, native: Any = None) -> list[dict[str, Any]]:
     """Dense hits among view pages (subject / timeline / source / index pages); returns empty when the collection
     does not exist. Not filtered by the question's time window: timeline and subject pages span time by nature."""
     try:
-        rows = _query_points(q, page_collection, vector, limit)
+        rows = native.dense("page", vector, limit, None) if native is not None else _query_points(q, page_collection, vector, limit)
     except Exception:
         return []
     for r in rows:
@@ -693,6 +695,7 @@ def graph_query(
     history: bool = False,
     as_of: str | None = None,
     include_chunks: bool = True,
+    native: Any = None,
 ) -> dict[str, Any]:
     """history / as_of:关系与事实的时间口径(currency.query_scope;默认现行)。实体没有时间,不受影响。
     vector:调用方已经算好的问题向量(检索服务里一次嵌入三路共用);lexical_only:嵌入服务不可用时
@@ -712,22 +715,22 @@ def graph_query(
             model_id=settings.embedding_model_id, dim=settings.embedding_dim, batch_size=1,
         )
         vector = embedder.embed([question])[0]
-    if q is None:
+    if q is None and native is None:
         q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     deadline = time.monotonic() + float(timeout) if timeout and not include_chunks else None
-    if deadline is not None:
+    if deadline is not None and native is None:
         q = _DeadlineClient(q, deadline)
     seeds_only = seed_filter()
-    collections = graph_collections_for(source.collection, graph_version)
+    collections = graph_collections_for(source.collection, native.version if native is not None else graph_version)
     entity_alias, relation_alias = collections["entity"], collections["relation"]
     window = question_time_window(question)
     if vector is not None:
-        entity_seeds = _query_points(q, entity_alias, vector, top_entities, seeds_only)
-        relation_seeds = [r for r in _query_points(q, relation_alias, vector, top_relations, relation_filter(scope)) if in_scope(r, scope)]
+        entity_seeds = native.dense("entity", vector, top_entities, scope) if native is not None else _query_points(q, entity_alias, vector, top_entities, seeds_only)
+        relation_seeds = native.dense("relation", vector, top_relations, scope) if native is not None else [r for r in _query_points(q, relation_alias, vector, top_relations, relation_filter(scope)) if in_scope(r, scope)]
     else:
         entity_seeds, relation_seeds = [], []
     # 词法种子:问题里的记号按名字精确命中的实体 / 关系,与稠密种子合并(同 id 取高分)
-    lex_entities, lex_relations = lexical_seeds(q, entity_alias, relation_alias, question, scope=scope, vector=vector)
+    lex_entities, lex_relations = (native.lexical_seeds(question, scope, vector) if native is not None else lexical_seeds(q, entity_alias, relation_alias, question, scope=scope, vector=vector))
     dense_e = {str(s.get("gr_id")): s for s in entity_seeds}
     for s in lex_entities:
         cur = dense_e.get(str(s.get("gr_id")))
@@ -742,18 +745,20 @@ def graph_query(
             s["_via"] = "lexical"
             dense_r[str(s.get("gr_id"))] = s
     relation_seeds = list(dense_r.values())
-    specs = spec_seeds(q, collections["spec"], vector, question, limit=top_relations, window=window, scope=scope)
-    pages = page_seeds(q, collections["page"], vector, question) if vector is not None else []
+    specs = spec_seeds(q, collections["spec"], vector, question, limit=top_relations, window=window, scope=scope, native=native)
+    pages = page_seeds(q, collections["page"], vector, question, native=native) if vector is not None else []
     doc_paths: dict[str, str] = {}          # 页面 doc_ids -> 文件路径;评测按它判主体页出自哪份文档
     series_of: dict[str, list[dict[str, Any]]] = {}      # 事实序列键 -> 全部档位(不按时间口径筛)
     seed_summary = {"entities": len(entity_seeds), "relations": len(relation_seeds), "specs": len(specs), "pages": len(pages),
                     "lexical_entities": sum(1 for s in entity_seeds if s.get("_via") == "lexical"), "lexical_only": vector is None}
 
-    own_driver = driver is None
+    own_driver = driver is None and native is None
     if own_driver:
         driver = neo4j_driver(settings)
     try:
-        if deadline is not None and not graph_version:
+        if native is not None:
+            gv = native.version
+        elif deadline is not None and not graph_version:
             with driver.session() as version_session:
                 record = TimedSession(version_session, timeout, deadline=deadline).run(
                     "MATCH (k:KB {kb_id: $kb}) RETURN k.active_graph_version AS gv", kb=source.kb_id).single()
@@ -792,17 +797,18 @@ def graph_query(
                         entity_scores[end] = {"id": end, "title": None, "type": None, "score": seed["_score"] / 2,
                                               "hop": 0, "via": "relation"}
 
-        with driver.session() as session:
-            if timeout:
+        from contextlib import nullcontext
+        with (nullcontext(native) if native is not None else driver.session()) as session:
+            if timeout and native is None:
                 session = TimedSession(session, timeout, deadline=deadline)
-            stats = version_stats(session, source.kb_id, gv) if include_chunks else {"max_rank": 1.0}
+            stats = (native.ranking_stats() if native is not None else version_stats(session, source.kb_id, gv)) if include_chunks else {"max_rank": 1.0}
             max_rank = stats["max_rank"]          # pagerank normalization factor
             frontier = list(entity_scores)
             seed_ids = set(entity_scores)          # relations with both ends seeded (in-network) do not decay by hop (GraphRAG local)
             for hop in range(1, max(0, int(hops)) + 1):
                 if not frontier:
                     break
-                rows = session.run(
+                rows = (native.expand(frontier, int(per_node) * (EXPAND_FETCH_FACTOR if hop == 1 else 1), scope) if native is not None else session.run(
                     """
                     UNWIND $ids AS eid
                     MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[r:RELATED_TO]-(n:Entity)
@@ -821,10 +827,10 @@ def graph_query(
                     RETURN eid, neighbours
                     """,
                     ids=frontier, kb=source.kb_id, gv=gv, k=int(per_node) * (EXPAND_FETCH_FACTOR if hop == 1 else 1), day=scope["day"],
-                ).data()
+                ).data())
                 next_frontier: list[str] = []
-                cosines = relation_cosines(q, relation_alias, gv, vector,
-                                           [str(nb.get("rid") or "") for row in rows for nb in row["neighbours"] or [] if nb.get("rid")]) \
+                cosines = (native.relation_cosines(vector, [str(nb.get("rid") or "") for row in rows for nb in row["neighbours"] or [] if nb.get("rid")]) if native is not None else relation_cosines(q, relation_alias, gv, vector,
+                                           [str(nb.get("rid") or "") for row in rows for nb in row["neighbours"] or [] if nb.get("rid")])) \
                     if hop == 1 and EXPAND_FETCH_FACTOR > 1 else {}
                 for row in rows:
                     base = entity_scores.get(str(row["eid"]), {}).get("score", 0.0)
@@ -857,24 +863,24 @@ def graph_query(
             # Fill in missing titles
             missing = [eid for eid, s in entity_scores.items() if not s.get("title")]
             if missing:
-                for row in session.run(
+                for row in (native.entity_titles(missing) if native is not None else session.run(
                     "UNWIND $ids AS eid MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid}) "
                     "RETURN eid, e.title AS title, e.type AS type, e.upper AS upper, e.kind AS kind, e.scope AS scope",
                     ids=missing, kb=source.kb_id, gv=gv,
-                ).data():
+                ).data()):
                     entity_scores[str(row["eid"])].update({"title": row["title"], "type": row["type"], "upper": row.get("upper"),
                                                            "kind": row.get("kind"), "scope": row.get("scope")})
             rel_missing = [rid for rid, s in relation_scores.items() if not s.get("source")]
             if rel_missing:
-                for row in session.run(
+                for row in (native.relation_titles(rel_missing) if native is not None else session.run(
                     "UNWIND $ids AS rid MATCH (r:Relation {kb_id: $kb, graph_version: $gv, id: rid}) "
                     "RETURN rid, r.source AS source, r.target AS target", ids=rel_missing, kb=source.kb_id, gv=gv,
-                ).data():
+                ).data()):
                     relation_scores[str(row["rid"])].update({"source": row["source"], "target": row["target"]})
             # 补齐同一查询范围内未进入事实排序结果的时间档位。
             series_keys = sorted({str(sp.get("series_key")) for sp in specs[:top_relations] if sp.get("series_key")})
             if series_keys:
-                for row in session.run(
+                for row in (native.series_rows(series_keys, scope) if native is not None else session.run(
                     "MATCH (f:Spec {kb_id: $kb, graph_version: $gv}) WHERE f.series_key IN $keys AND "
                     + cypher_in_scope("f", observed="observed", scope=scope) + " "
                     "RETURN f.series_key AS series_key, f.id AS id, f.value AS value, f.min AS min, f.typ AS typ, f.max AS max, "
@@ -882,7 +888,7 @@ def graph_query(
                     "f.observed_at AS observed_at, f.observed AS observed, f.time_basis AS time_basis, "
                     "f.series_index AS series_index ORDER BY series_key, coalesce(f.series_index, 0), f.id",
                     kb=source.kb_id, gv=gv, keys=series_keys, day=scope["day"],
-                ).data():
+                ).data()):
                     members = series_of.setdefault(str(row["series_key"]), [])
                     if len(members) < SERIES_MEMBERS_MAX:
                         members.append({**{k: row.get(k) for k in ("id", "value", "min", "typ", "max", "unit", "unit_canonical",
@@ -890,10 +896,10 @@ def graph_query(
                                         "when": row.get("valid_from") or row.get("observed_at") or row.get("axis") or row.get("observed")})
             page_doc_ids = sorted({str(d) for pg in pages for d in (pg.get("doc_ids") or [])})
             if page_doc_ids:
-                for row in session.run(
+                for row in (native.document_paths(page_doc_ids) if native is not None else session.run(
                     "MATCH (d:Document {kb_id: $kb, graph_version: $gv}) WHERE d.doc_id IN $ids "
                     "RETURN d.doc_id AS doc_id, d.rel_path AS rel_path", ids=page_doc_ids, kb=source.kb_id, gv=gv,
-                ).data():
+                ).data()):
                     if row.get("rel_path"):
                         doc_paths[str(row["doc_id"])] = str(row["rel_path"])
 
@@ -904,11 +910,14 @@ def graph_query(
                 # Only return the bounded frontier; source samples are not recall candidates.
                 entity_scores = dict(sorted(entity_scores.items(), key=lambda item: -item[1]["score"])[:top_entities * 2])
                 relation_scores = dict(sorted(relation_scores.items(), key=lambda item: -item[1]["score"])[:top_relations * 2])
-                discovery_sources(session, source.kb_id, gv, entity_scores, relation_scores)
+                if native is not None:
+                    native.discovery_sources(entity_scores, relation_scores)
+                else:
+                    discovery_sources(session, source.kb_id, gv, entity_scores, relation_scores)
             else:
                 n_chunks = stats["n_chunks"]
                 mean_hub = stats["total_mentions"] / n_chunks if n_chunks else 0.0
-                mention_rows = session.run(
+                mention_rows = (native.mentions(list(entity_scores)) if native is not None else session.run(
                     """
                     UNWIND $ids AS eid
                     MATCH (e:Entity {kb_id: $kb, graph_version: $gv, id: eid})-[m:MENTIONED_IN]->(c:QdrantChunkSnapshot)
@@ -917,7 +926,7 @@ def graph_query(
                            size([(c)<-[:MENTIONED_IN]-() | 1]) AS hub, coalesce(c.kind, 'body') AS kind
                     """,
                     ids=list(entity_scores), kb=source.kb_id, gv=gv,
-                ).data()
+                ).data())
                 entity_df: dict[str, int] = {}
                 entity_docs: dict[str, set[str]] = {}
                 for row in mention_rows:
@@ -947,7 +956,7 @@ def graph_query(
                                                       "count": int(row.get("count") or 0), "df": entity_df.get(eid, 1), "weight": weight})
                     slot["entities"].append(entity_scores[eid].get("title"))
                 if relation_scores:
-                    evidence_rows = session.run(
+                    evidence_rows = (native.evidences(list(relation_scores)) if native is not None else session.run(
                         """
                         UNWIND $ids AS rid
                         MATCH (tu:TextUnit {kb_id: $kb, graph_version: $gv})-[:EVIDENCES]->(r:Relation {kb_id: $kb, graph_version: $gv, id: rid})
@@ -956,7 +965,7 @@ def graph_query(
                         RETURN rid, c.point_id AS point_id, c.chunk_uid AS chunk_uid, c.rel_path AS rel_path, coalesce(tu.kind, 'body') AS kind
                         """,
                         ids=list(relation_scores), kb=source.kb_id, gv=gv,
-                    ).data()
+                    ).data())
                     relation_df: dict[str, int] = {}
                     for row in evidence_rows:
                         relation_df[str(row["rid"])] = relation_df.get(str(row["rid"]), 0) + 1
@@ -1021,16 +1030,21 @@ def graph_query(
         c["graph_score"] = c["score"]
         c["graph_rank"] = rank
     if candidates:
-        points = q.retrieve(collection_name=source.collection, ids=[c["point_id"] for c in candidates],
-                            with_payload=True, with_vectors=[TEXT_VECTOR_NAME])
-        by_id = {str(p.id): p for p in points}
+        if native is not None:
+            ids = [c["point_id"] for c in candidates]
+            payload_map = native.store.chunks.payloads(source.collection, ids)
+            vector_map = native.store.chunks.vectors(source.collection, ids)
+        else:
+            points = q.retrieve(collection_name=source.collection, ids=[c["point_id"] for c in candidates],
+                                with_payload=True, with_vectors=[TEXT_VECTOR_NAME])
+            payload_map = {str(p.id): dict(p.payload or {}) for p in points}
+            vector_map = {str(p.id): p.vector.get(TEXT_VECTOR_NAME) if isinstance(p.vector, dict) else p.vector for p in points}
         for c in candidates:
-            p = by_id.get(c["point_id"])
-            payload = dict((p.payload if p is not None else None) or {})
+            payload = payload_map.get(c["point_id"], {})
             if not c.get("chunk_uid"):
                 c["chunk_uid"] = payload.get("chunk_uid")
                 c["rel_path"] = c.get("rel_path") or payload.get("rel_path")
-            vec = p.vector.get(TEXT_VECTOR_NAME) if p is not None and isinstance(p.vector, dict) else (p.vector if p is not None else None)
+            vec = vector_map.get(c["point_id"])
             text = str(payload.get("text") or "")
             c["cos"] = round(_cosine(vector, list(vec) if vec is not None else None), 4) if vector is not None else 0.0
             c["lex"] = round(lexical_overlap(question, text), 4)
@@ -1038,6 +1052,8 @@ def graph_query(
             c["section"] = " > ".join(str(s) for s in (payload.get("section_path") or []))
             if with_text:
                 c["snippet"] = text[:400]
+    if native is not None and candidates:
+        candidates = [c for c in candidates if payload_map.get(c["point_id"], {}).get("is_active", False)]
     chunks = sorted(candidates, key=lambda c: -c["score"])[:chunk_limit]
     for c in chunks:
         c["entities"] = sorted({e for e in c["entities"] if e})[:8]

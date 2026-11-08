@@ -2,6 +2,8 @@
 
 [首页](../README.zh-CN.md) · [English](operations.md) | 中文
 
+容器部署的启停与更新见[Compose 运维](../deployment/compose/README.zh-CN.md#调度重启与升级)。下方命令针对源码部署；容器中对应的 CLI 可通过 `docker compose exec app python -m kb_pipeline` 执行。
+
 除非命令中明确使用 `cd`，以下操作均以仓库根目录为起点。文中的 `kb` 指 `app/.venv/bin/kb`，安装包也提供同等入口 `carrel`。
 
 ## 控制台
@@ -47,18 +49,16 @@
 
 | 命令 | 作用 |
 |---|---|
-| `./deploy.sh` | 检测环境并部署，保留已有配置 |
-| `./deploy.sh detect` | 查看环境检测和拟采用的配置 |
+| `./deploy.sh --build` | 构建并启动 Compose 服务，保留已有配置和数据 |
+| `./deploy.sh detect` | 查看宿主机平台和可用 NVIDIA 设备 |
 | `./deploy.sh --cpu` | 使用 CPU 解析部署方式 |
-| `./deploy.sh --with-local-models` | 加入可选模型服务，需先准备权重 |
+| `./deploy.sh --standard` | 新部署使用 Qdrant、OpenSearch 和 Neo4j |
+| `./deploy.sh --light` | 新部署使用内嵌 LanceDB 和 DuckDB |
 | `./deploy.sh --with-pdf-images` | 安装可选的 PDF 原图支持 |
-| `./deploy.sh status` | 查看容器与控制台健康状态 |
+| `./deploy.sh status` | 查看 Compose 容器 |
 | `./deploy.sh down` | 停止并移除 Compose 容器，保留数据；应用的 systemd 服务单独管理 |
-| `./deploy.sh purge` | 移除部署容器、自建解析镜像、服务单元和 Compose 配置 |
 
-`purge --images` 还会删除拉取的镜像，`purge --data` 会删除运行数据与模型权重。使用这些删除选项前，先备份需要保留的数据。
-
-Linux 上可用以下命令查看服务：
+原生 Linux systemd 部署可用以下命令查看服务：
 
 ```bash
 systemctl --user list-timers 'carrel-*'
@@ -67,7 +67,7 @@ journalctl --user -u carrel-graph-rebuild --since -3h
 journalctl --user -u carrel-web --since -5min
 ```
 
-[systemd 文档](../deployment/systemd/README.md) 介绍安装、用户会话退出后继续运行、单元模板及无 systemd 环境下的调度方式。[Compose 文档](../deployment/compose/README.md) 介绍后端选择、模型权重、内存配置与容器日志。
+[systemd 文档](../deployment/systemd/README.md) 介绍安装、用户会话退出后继续运行、单元模板及无 systemd 环境下的调度方式。[Compose 文档](../deployment/compose/README.zh-CN.md) 介绍后端选择、MinerU 资源、数据挂载、内存配置与容器日志。
 
 ## 定时任务
 
@@ -140,7 +140,7 @@ systemctl --user start --no-block carrel-worker.service
 
 ## 开发与测试
 
-`deploy.sh` 按 `app/requirements.lock` 安装测试过的那套版本（含 pytest）；手动安装等价于 `app/.venv/bin/pip install -r app/requirements.lock -e app`。依赖有变动时，在测试过的虚拟环境里用 `app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml --output app/requirements.lock` 重新生成锁文件。安装应用和测试依赖后执行：
+应用镜像按 `app/requirements.lock` 和 `app/requirements-light.lock` 安装固定依赖。本地开发使用 `app/.venv/bin/pip install -r app/requirements.lock -r app/requirements-light.lock -e 'app[light]'`，可选 PDF 图片测试另装 `app/requirements-pdf-images.lock`。依赖有变动时，在测试过的虚拟环境里用 `app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml --output app/requirements.lock` 重新生成锁文件。安装应用和测试依赖后执行：
 
 ```bash
 cd app

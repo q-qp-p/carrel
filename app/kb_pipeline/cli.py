@@ -14,6 +14,7 @@ from pathlib import Path
 from . import db
 from . import discovery, search_fts
 from .config import load_settings
+from .storage import get_storage
 from .graph.build import (GraphBuildCalledOff, GraphBuildInterrupted, adopt_current_graph, build_graph, evaluate_append, evaluate_rebuild,
                           graph_cache_fingerprint, graph_retirable, kb_still_active, llm_ready, retire_graph,
                           rollback_graph_version)
@@ -47,6 +48,7 @@ from .vector.qdrant import ensure_graph_collection, graph_collection_alias, grap
 def cmd_config(args: argparse.Namespace) -> int:
     settings = load_settings(args.env_file)
     data = {
+        "storage_backend": settings.storage_backend,
         "state_db": str(settings.state_db),
         "opensearch_url": settings.opensearch_url,
         "runtime_dir": str(settings.runtime_dir),
@@ -58,6 +60,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "embedding_model_id": settings.embedding_model_id,
         "embedding_dim": settings.embedding_dim,
         "embedding_batch": settings.embedding_batch,
+        "embedding_concurrency": settings.embedding_concurrency,
         "embedding_retry": settings.embedding_retry,
         "embedding_sleep_seconds": settings.embedding_sleep_seconds,
         "embedding_api_key": "***" if settings.embedding_api_key else "",
@@ -68,6 +71,8 @@ def cmd_config(args: argparse.Namespace) -> int:
         "visual_embedding_base_url": settings.visual_embedding_base_url,
         "visual_embedding_model_id": settings.visual_embedding_model_id,
         "visual_embedding_dim": settings.visual_embedding_dim,
+        "visual_embedding_batch": settings.visual_embedding_batch,
+        "visual_embedding_concurrency": settings.visual_embedding_concurrency,
         "visual_embedding_concurrency": settings.visual_embedding_concurrency,
         "image_max_pixels": settings.image_max_pixels,
         "vector_layout": settings.vector_layout.sizes(),
@@ -517,29 +522,37 @@ def cmd_health(args: argparse.Namespace) -> int:
     checks["state_db_parent_exists"] = settings.state_db.parent.exists()
     checks["cache_dir_parent_exists"] = settings.cache_dir.parent.exists()
     checks["qdrant_key_present"] = bool(settings.qdrant_api_key)
-    try:
-        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-        existing = {item.name for item in q.get_collections().collections}
-        collections: dict[str, object] = {}
-        expected_layout = settings.vector_layout.sizes()
-        for collection in sorted({source.collection for source in settings.sources.values()}):
-            if collection not in existing:
+    if getattr(settings, "storage_backend", "standard") == "light":
+        try:
+            store = get_storage(settings)
+            store.graph.check()
+            checks["storage"] = {"backend": "light", "ok": True}
+        except Exception as exc:
+            checks["storage"] = {"backend": "light", "ok": False, "error": repr(exc)}
+    else:
+        try:
+            q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+            existing = {item.name for item in q.get_collections().collections}
+            collections: dict[str, object] = {}
+            expected_layout = settings.vector_layout.sizes()
+            for collection in sorted({source.collection for source in settings.sources.values()}):
+                if collection not in existing:
+                    collections[collection] = {
+                        "exists": False,
+                        "expected_vectors": expected_layout,
+                        "ok": False,
+                    }
+                    continue
+                actual_layout = collection_vector_layout(q, collection)
                 collections[collection] = {
-                    "exists": False,
+                    "exists": True,
+                    "vectors": actual_layout,
                     "expected_vectors": expected_layout,
-                    "ok": False,
+                    "ok": actual_layout == expected_layout,
                 }
-                continue
-            actual_layout = collection_vector_layout(q, collection)
-            collections[collection] = {
-                "exists": True,
-                "vectors": actual_layout,
-                "expected_vectors": expected_layout,
-                "ok": actual_layout == expected_layout,
-            }
-        checks["qdrant"] = {"collections": collections}
-    except Exception as exc:
-        checks["qdrant"] = {"error": repr(exc)}
+            checks["qdrant"] = {"collections": collections}
+        except Exception as exc:
+            checks["qdrant"] = {"error": repr(exc)}
     try:
         checks["mineru"] = mineru_health(settings.mineru_url)
     except Exception as exc:
@@ -550,16 +563,17 @@ def cmd_health(args: argparse.Namespace) -> int:
     if settings.visual_embedding_enabled:
         endpoints["visual_embedding"] = _vllm_health(settings.visual_embedding_base_url)
     checks["endpoints"] = endpoints
-    try:
-        os_health = requests.get(
-            f"{settings.opensearch_url.rstrip('/')}/_cluster/health", timeout=5
-        ).json()
-        checks["opensearch"] = {
-            "status": os_health.get("status"),
-            "ok": os_health.get("status") in {"green", "yellow"},
-        }
-    except Exception as exc:
-        checks["opensearch"] = {"error": repr(exc), "ok": False}
+    if getattr(settings, "storage_backend", "standard") != "light":
+        try:
+            os_health = requests.get(
+                f"{settings.opensearch_url.rstrip('/')}/_cluster/health", timeout=5
+            ).json()
+            checks["opensearch"] = {
+                "status": os_health.get("status"),
+                "ok": os_health.get("status") in {"green", "yellow"},
+            }
+        except Exception as exc:
+            checks["opensearch"] = {"error": repr(exc), "ok": False}
     print(json.dumps(checks, ensure_ascii=False, indent=2))
     return 0
 
@@ -580,16 +594,18 @@ def _vllm_health(base_url: str) -> dict[str, object]:
 
 def cmd_qdrant(args: argparse.Namespace) -> int:
     settings = load_settings(args.env_file)
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    store = get_storage(settings)
     for source in settings.sources.values():
-        result = ensure_collection(q, source.collection, settings.vector_layout, dry_run=args.dry_run)
+        result = store.chunks.ensure(source.collection, settings.vector_layout, dry_run=args.dry_run)
         print(result)
     return 0
 
 
 def cmd_qdrant_graph(args: argparse.Namespace) -> int:
     settings = load_settings(args.env_file)
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    light = getattr(settings, "storage_backend", "standard") == "light"
+    store = get_storage(settings) if light else None
+    q = None if light else qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     graph_types = args.graph_type or list(GRAPH_VECTOR_TYPES)
     source_keys = args.source
     if not source_keys and not args.collection and not args.all:
@@ -608,7 +624,11 @@ def cmd_qdrant_graph(args: argparse.Namespace) -> int:
         for graph_type in graph_types:
             alias = graph_collection_alias(source.collection, graph_type)
             physical = graph_collection_name(source.collection, graph_type, args.graph_version)
-            status = ensure_graph_collection(q, physical, settings.embedding_dim, dry_run=args.dry_run)
+            if light:
+                from .vector.qdrant import graph_vector_layout
+                status = "dry_run" if args.dry_run else store.graph.vectors.ensure(physical,settings.embedding_dim,graph_vector_layout(graph_type))
+            else:
+                status = ensure_graph_collection(q, physical, settings.embedding_dim, dry_run=args.dry_run)
             result.append({
                 "source": key,
                 "kb_id": source.kb_id,
@@ -626,6 +646,20 @@ def cmd_fts(args: argparse.Namespace) -> int:
     settings = load_settings(args.env_file)
     requested_collections = getattr(args, "collection", None)
     collections = [requested_collections] if isinstance(requested_collections, str) else _selected_collections(settings, requested_collections)
+    if getattr(settings, "storage_backend", "standard") == "light":
+        store = get_storage(settings)
+        if args.fts_command in ("init", "rebuild"):
+            result = {"ensured": store.keywords.ensure(collections)}
+        elif args.fts_command == "status":
+            result = {col: {"chunks": store.chunks.active_count(col) if store.chunks.exists(col) else 0} for col in collections}
+        elif args.fts_command == "sync-doc":
+            result = store.keywords.sync_document(args.collection,args.doc_id)
+        elif args.fts_command == "search":
+            result = {"query": args.query, "results": {col: store.keywords.candidates(args.query,col,limit=args.limit) for col in collections}}
+        else:
+            raise ValueError(f"unknown keyword command: {args.fts_command}")
+        print(json.dumps(result,ensure_ascii=False,indent=2))
+        return 0
     if args.fts_command == "init":
         result = {
             "ensured": search_fts.ensure_indices(settings.opensearch_url, collections),
@@ -704,8 +738,10 @@ def cmd_reset(args: argparse.Namespace) -> int:
             print("no changes made; rerun with --yes to purge state/cache and reset Qdrant collection(s)")
             return 0
 
-        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-        if not args.keep_collection:
+        light = getattr(settings, "storage_backend", "standard") == "light"
+        store = get_storage(settings) if light else None
+        q = None if light else qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        if not args.keep_collection and q is not None:
             q.get_collections()
         reset_collections: set[str] = set()
         for key, source in selected:
@@ -731,10 +767,16 @@ def cmd_reset(args: argparse.Namespace) -> int:
 
         if not args.keep_collection:
             for collection in sorted(reset_collections):
-                print(delete_collection(q, collection))
-                print(search_fts.delete_collection(settings.opensearch_url, collection=collection))
-                if not args.no_recreate:
-                    print(ensure_collection(q, collection, settings.vector_layout))
+                if light:
+                    from .storage.light_maintenance import drop_collection
+                    print(drop_collection(store.chunks, collection))
+                    if not args.no_recreate:
+                        print(store.chunks.ensure(collection, settings.vector_layout))
+                else:
+                    print(delete_collection(q, collection))
+                    print(search_fts.delete_collection(settings.opensearch_url, collection=collection))
+                    if not args.no_recreate:
+                        print(ensure_collection(q, collection, settings.vector_layout))
     return 0
 
 
@@ -1193,8 +1235,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
         if len(selected) != 1 and args.graph_version:
             raise ValueError("--graph-version can only be used with a single selected source")
         results = [
-            import_graph_to_neo4j(
-                settings,
+            get_storage(settings).graph.import_version(
                 source_key=key,
                 source=source,
                 graph_version=args.graph_version,
@@ -1215,7 +1256,7 @@ def cmd_graph(args: argparse.Namespace) -> int:
         if len(selected) != 1:
             raise ValueError("query requires exactly one selected source")
         _, source = selected[0]
-        result = graph_query(settings, source, args.question, hops=args.hops, chunk_limit=args.limit)
+        result = get_storage(settings).graph.query(source, args.question, hops=args.hops, limit=args.limit)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
@@ -1243,6 +1284,22 @@ def cmd_graph(args: argparse.Namespace) -> int:
             out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             out.with_suffix(".md").write_text(factcheck_markdown(report, source.kb_id), encoding="utf-8")
         print(json.dumps(report["summary"], ensure_ascii=False, indent=2))
+        return 0
+
+    if getattr(settings,"storage_backend","standard") == "light" and args.graph_command in ("neo4j-status","neo4j-delete"):
+        store = get_storage(settings)
+        if args.graph_command == "neo4j-status":
+            result = [{"kb_id": source.kb_id, "graph_version": store.graph.stats(source.kb_id)[0],
+                       "stats": store.graph.stats(source.kb_id)[1]} for _,source in selected]
+        else:
+            if len(selected) != 1 or not args.graph_version:
+                raise ValueError("delete requires one source and --graph-version")
+            _,source = selected[0]
+            if store.graph.stats(source.kb_id)[0] == args.graph_version:
+                raise ValueError("cannot delete the active graph version")
+            result = store.graph.collect_versions(sources=[source],retention_days=365000,
+                discard_versions=[args.graph_version],dry_run=args.dry_run)
+        print(json.dumps(result,ensure_ascii=False,indent=2))
         return 0
 
     if args.graph_command == "neo4j-status":

@@ -6,8 +6,8 @@ set -euo pipefail
 # KB_LOCAL_BASE_DIR (systemd injects it, interactive shells usually do not).
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${KB_LOCAL_BASE_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
-APP_DIR="$BASE_DIR/app"
-PY="$APP_DIR/.venv/bin/python"
+APP_DIR="${KB_APP_DIR:-$BASE_DIR/app}"
+PY="${KB_PYTHON:-$APP_DIR/.venv/bin/python}"
 if [[ -n "${KB_ENV_FILE:-}" ]]; then
   ENV_FILE="$KB_ENV_FILE"
 elif [[ -f "$BASE_DIR/config/knowledge-base.env" ]]; then
@@ -38,11 +38,16 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-QDRANT_HEALTH_URL="${QDRANT_URL:-http://127.0.0.1:6333}"
-QDRANT_HEALTH_URL="${QDRANT_HEALTH_URL%/}/healthz"
-if ! /usr/bin/curl -fsS --max-time "${KB_QDRANT_HEALTH_TIMEOUT_SECONDS:-5}" "$QDRANT_HEALTH_URL" >/dev/null 2>&1; then
-  echo "=== $(ts) KB worker deferred (Qdrant unavailable; queue preserved) ==="
-  exit 0
+# shellcheck source=lib/kb-maint-defer.sh
+source "$SCRIPT_DIR/lib/kb-maint-defer.sh"
+STORAGE_BACKEND="$(maint_storage_backend)"
+if [[ "$STORAGE_BACKEND" == "standard" ]]; then
+  QDRANT_HEALTH_URL="${QDRANT_URL:-http://127.0.0.1:6333}"
+  QDRANT_HEALTH_URL="${QDRANT_HEALTH_URL%/}/healthz"
+  if ! /usr/bin/curl -fsS --max-time "${KB_QDRANT_HEALTH_TIMEOUT_SECONDS:-5}" "$QDRANT_HEALTH_URL" >/dev/null 2>&1; then
+    echo "=== $(ts) KB worker deferred (Qdrant unavailable; queue preserved) ==="
+    exit 0
+  fi
 fi
 
 lock_age_seconds() {

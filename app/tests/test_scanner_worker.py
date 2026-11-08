@@ -942,7 +942,7 @@ class JobCancellationTests(unittest.TestCase):
 
 
 @contextmanager
-def _parse_harness(tmp: str):
+def _parse_harness(tmp: str, *, filename="a.md", text="# 标题\n\n正文"):
     """Run the real worker and process_parse_job with only the external services (parsers, embedding, Qdrant,
     OpenSearch) stubbed. Provides an enrolled KB, one file on disk and its queued parse job; h.hooks[step] is an
     action run first when that step is reached, h.calls records the steps passed in order, h.args[step] holds the
@@ -952,11 +952,12 @@ def _parse_harness(tmp: str):
     from kb_pipeline import discovery
     from kb_pipeline.localfs.scanner import list_source_files
     from kb_pipeline.pipeline import parse_job as pj
+    from kb_pipeline.storage import standard
     from kb_pipeline.vector.layout import VectorLayout
 
     base = Path(tmp)
     mirror = base / "mirror"; (mirror / "库A").mkdir(parents=True)
-    (mirror / "库A" / "a.md").write_text("# 标题\n\n正文", encoding="utf-8")
+    (mirror / "库A" / filename).write_text(text, encoding="utf-8")
     state = base / "s.db"; db.init_db(state)
     with db.connect(state) as con:
         src, _ = discovery.enroll(con, mirror, "库A"); con.commit()
@@ -999,7 +1000,8 @@ def _parse_harness(tmp: str):
         "_parse_blocks": step("parse", [_block("b1", "正文内容,足够切成一片。")]),
         "EmbeddingClient": Embedder,
         "_embed_visual_chunks": step("visual", {}),
-        "qdrant_client": step("qdrant"),
+    }
+    storage_stubs = {
         "collection_exists": step("collection", True),
         "validate_collection_layout": step("layout"),
         "upsert_chunks": step("upsert"),
@@ -1012,14 +1014,17 @@ def _parse_harness(tmp: str):
         con.commit()
         for name, stub in stubs.items():
             stack.enter_context(mock.patch.object(pj, name, stub))
-        stack.enter_context(mock.patch.object(
-            pj.search_fts, "sync_doc_from_qdrant", step("fts", {"doc_id": "d", "inserted_rows": 1, "deleted_rows": 0})))
+        stack.enter_context(mock.patch.object(standard, "vector_client", step("qdrant", object())))
+        for name, stub in storage_stubs.items():
+            stack.enter_context(mock.patch.object(standard.qdrant, name, stub))
+        stack.enter_context(mock.patch(
+            "kb_pipeline.search_fts.sync_doc_from_qdrant", step("fts", {"doc_id": "d", "inserted_rows": 1, "deleted_rows": 0})))
         h.con = con
         yield h
 
 
 def _rescan(h, run_id: str = "r2"):
-    """Scan once more (the KB holds only a.md): returns schedule_file's (change type, new job id)."""
+    """Scan once more (the KB holds one source file): returns schedule_file's (change type, new job id)."""
     from kb_pipeline import discovery
     from kb_pipeline.localfs.scanner import list_source_files
 
@@ -2183,7 +2188,7 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
         degraded = main.split("except Exception as exc:", 1)[1]
         self.assertIn('fts_result = {"inserted_rows": 0, "deferred": True}', degraded)
         empty = src.split("def _finish_empty_document", 1)[1].split("\ndef ", 1)[0]
-        self.assertIn("try:\n        fts_result = search_fts.sync_doc_from_qdrant(", empty)
+        self.assertIn("try:\n        fts_result = store.keywords.sync_document(", empty)
         self.assertIn('fts_result = {"inserted_rows": 0, "deferred": True}', empty)
         self.assertIn("_defer_fts_sync(", empty)      # 09-06 evening: the compensation job became its own fts_sync type (F06)
 
@@ -2273,7 +2278,7 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
                 self.assertIsNone(con.execute("SELECT resolved_at FROM failures WHERE job_id=?", (fts_job,)).fetchone()[0])
                 # 2. The worker runs the compensation: OpenSearch still down → backoff retry, the failure record still
                 #    hangs under it
-                with mock.patch.object(worker_mod, "qdrant_client"), \
+                with mock.patch("kb_pipeline.storage.standard.vector_client"), \
                         mock.patch.object(worker_mod, "_sync_fts_doc", side_effect=RuntimeError("still down")):
                     result = worker_mod.run_once(con, settings=settings)
                 self.assertTrue(result.startswith("retry:"), result)
@@ -2288,7 +2293,7 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
                 self.assertEqual(requeue_failed_lifecycle_jobs(con, ingest_run_id="r3"), 0)     # already queued, no duplicate
                 # 4. OpenSearch is back: the worker rewrites the index from the active points, the job completes and
                 #    the failure record is resolved
-                with mock.patch.object(worker_mod, "qdrant_client"), \
+                with mock.patch("kb_pipeline.storage.standard.vector_client"), \
                         mock.patch.object(worker_mod, "_sync_fts_doc") as synced:
                     result = worker_mod.run_once(con, settings=settings)
                 self.assertTrue(result.startswith("fts-sync-done:"), result)
@@ -2301,7 +2306,7 @@ class WorkerFixRegressionTests(_CodexAudit20260906TestsSupport, unittest.TestCas
                 stale = db.enqueue_job(con, ingest_run_id=None, file_id=fid, kb_id=file.kb_id, collection=file.collection,
                                        file_key=file.file_key, job_type="fts_sync", priority=60,
                                        payload={"content_version": "old-version"}, dedupe_key=db.fts_sync_dedupe_key(fid, "old-version"))
-                with mock.patch.object(worker_mod, "qdrant_client"), \
+                with mock.patch("kb_pipeline.storage.standard.vector_client"), \
                         mock.patch.object(worker_mod, "_sync_fts_doc") as synced:
                     result = worker_mod.run_once(con, settings=settings)
                 self.assertTrue(result.startswith("fts-sync-done:"), result)

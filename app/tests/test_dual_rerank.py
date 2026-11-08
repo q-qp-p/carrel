@@ -93,12 +93,106 @@ def test_fused_refinements_are_counted_without_applying_them_twice(env):
     assert [c["score_final"] for c in result["ordered"]] == before
 
 
-def test_low_image_relevance_cannot_be_rescued_by_text_or_vector_score(env):
+def test_low_image_score_preserves_a_matching_caption_without_a_double_vote(env):
     env[2].return_value["scores"] = {"image": 0.02}
     result = run(env, [candidate("text"), candidate("image", image=True)], image_query=True, image_bytes=b"query")
-    assert [c["point_id"] for c in result["ordered"]] == ["text"]
-    assert next(c for c in result["cands"] if c["point_id"] == "image")["accepted"] is False
+    assert [c["point_id"] for c in result["ordered"]] == ["text", "image"]
+    row = result["ordered"][1]
+    assert row["accepted"] is True
+    assert row["score_rerank_visual"] == 0.02
+    assert row["ranking"]["branch"] == "text"
+    assert row["ranking"]["accepted_by"] == ["text", "visual_recall"]
+    assert row["score_fusion"] == 1 / 62
     assert env[2].call_args.kwargs["image_bytes"] == b"query"
+
+
+@pytest.mark.parametrize("image_query", [False, True])
+def test_visual_recall_can_only_retain_candidates_for_a_query_with_pixels(env, image_query):
+    env[2].return_value["scores"] = {"image": 0.02}
+    result = run(env, [candidate("text"), candidate("image", image=True, score=0.01)],
+                 image_query=image_query)
+    row = next(c for c in result["cands"] if c["point_id"] == "image")
+    assert row["accepted"] is image_query
+    if image_query:
+        assert row["ranking"]["branch"] == "visual_recall"
+        assert row["ranking"]["accepted_by"] == ["visual_recall"]
+        assert result["ordered"][0]["point_id"] == "image"
+
+
+@pytest.mark.parametrize("visual_score,expected", [(0.499, False), (0.5, True)])
+def test_visual_recall_retains_its_existing_relevance_gate(env, visual_score, expected):
+    env[2].return_value["scores"] = {"image": 0.02}
+    row = candidate("image", image=True, score=0.001)
+    row["scores"]["score_visual"] = visual_score
+    result = run(env, [candidate("text"), row], image_query=True)
+    assert result["cands"][1]["accepted"] is expected
+
+
+def test_matching_caption_remains_usable_when_every_candidate_is_an_image(env):
+    env[2].return_value["scores"] = {"image": 0.02}
+    result = run(env, [candidate("image", image=True)])
+    assert result["ordered"][0]["ranking"]["branch"] == "text"
+    assert result["floor"] == env[1].rerank_threshold
+    assert result["evidence_state"] == "accepted"
+
+
+def test_caption_retained_at_the_lowered_floor_has_consistent_text_status(env):
+    env[2].return_value["scores"] = {"image": 0.02}
+    result = run(env, [candidate("text", score=0.001), candidate("image", image=True, score=0.08)])
+    assert result["ranking"]["text"]["status"] == "floor_lowered"
+    assert result["ordered"][0]["ranking"]["accepted_by"] == ["text"]
+
+
+def test_unscored_image_recall_survives_the_bounded_visual_rerank_budget(env):
+    result = run(env, [candidate("image", image=True), candidate("unscored", image=True, score=0.001)],
+                 image_query=True)
+    row = next(c for c in result["ordered"] if c["point_id"] == "unscored")
+    assert row["ranking"]["branch"] == "visual_recall"
+    assert "score_rerank_visual" not in row
+
+
+def test_image_query_with_no_passing_signal_remains_diagnostic(env):
+    env[2].return_value["scores"] = {"image": 0.02}
+    row = candidate("image", image=True, score=0.001)
+    row["scores"]["score_visual"] = 0.49
+    result = run(env, [candidate("text", score=0.001), row], image_query=True)
+    assert result["evidence_state"] == "diagnostic"
+    assert all(c["accepted"] is False for c in result["ordered"])
+    assert all(c["ranking"]["accepted_by"] == [] for c in result["ordered"])
+
+
+def test_borderline_image_recall_does_not_outrank_strong_query_text(env):
+    env[2].return_value["scores"] = {"image": 0.02}
+    row = candidate("image", image=True, score=0.001)
+    row["scores"]["score_visual"] = 0.60
+    result = run(env, [row, candidate("text", score=0.95)], image_query=True)
+    text, image = result["ordered"]
+    assert text["point_id"] == "text"
+    assert image["point_id"] == "image" and image["accepted"] is True
+    assert image["ranking"]["margin_weight"] < text["ranking"]["margin_weight"]
+    assert result["ranking"]["fusion"]["method"] == "rank_margin"
+
+
+def test_strong_image_recall_does_not_yield_to_generic_query_text(env):
+    env[2].return_value["scores"] = {"image": 0.02}
+    result = run(env, [candidate("text", score=0.11), candidate("image", image=True, score=0.001)],
+                 image_query=True)
+    assert [c["point_id"] for c in result["ordered"]] == ["image", "text"]
+    assert result["ordered"][1]["accepted"] is True
+
+
+def test_recovered_visual_score_remains_a_similarity_not_a_model_judgment(env):
+    env[2].return_value["scores"] = {"image": 0.02}
+    result = run(env, [candidate("image", image=True, score=0.001)], image_query=True)
+    row = result["ordered"][0]
+    before = row["score_final"]
+    counts = service._final_scores(result["ordered"], env[1], reranked=True, image_query=True)
+    assert row["score_final"] == before
+    out = source_row(1, row, row["payload"])
+    assert out["scores"]["score_rerank_visual"] == 0.02
+    assert out["scores"]["score_visual"] == 0.99
+    assert out["ranking"]["branch"] == "visual_recall"
+    assert out["ranking"]["accepted_by"] == ["visual_recall"]
 
 
 def test_all_unrelated_is_diagnostic_even_when_every_list_has_a_first_place(env):
@@ -273,7 +367,9 @@ def test_image_caption_does_not_set_the_text_branch_floor(env, visual_score, ima
     result = run(env, [candidate("text", score=0.08), candidate("image", image=True, score=0.9)],
                  image_query=image_query)
     accepted = {c["point_id"]: c["accepted"] for c in result["cands"]}
-    assert accepted == {"text": True, "image": visual_score >= env[1].visual_rerank_threshold}
+    assert accepted == {"text": True, "image": True}
+    row = next(c for c in result["cands"] if c["point_id"] == "image")
+    assert row["ranking"]["branch"] == ("visual" if visual_score >= env[1].visual_rerank_threshold else "text")
     assert result["floor"] == pytest.approx(0.07)
     assert result["ranking"]["text"]["status"] == "floor_lowered"
     assert result["evidence_state"] == "accepted"
@@ -284,7 +380,7 @@ def test_partial_image_failure_recalculates_the_floor_for_remaining_text(env):
     result = run(env, [candidate("text", score=0.08), candidate("missing", image=True, score=0.09),
                        candidate("image", image=True, score=0.9)])
     accepted = {c["point_id"]: c["accepted"] for c in result["cands"]}
-    assert accepted == {"text": True, "missing": True, "image": False}
+    assert accepted == {"text": True, "missing": True, "image": True}
     assert result["ranking"]["visual"]["status"] == "partial"
     assert result["floor"] == pytest.approx(0.07)
 

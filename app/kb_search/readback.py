@@ -63,7 +63,7 @@ def candidates(question, result):
     return pool
 
 
-def read_originals(settings, ss, q, result, scope, hint, until, driver):
+def read_originals(settings, ss, q, result, scope, hint, until, driver, *, store=None):
     """Return additional numbered sources and the verified locators examined this round."""
     pool = candidates(result["question"], result)
     by_kb = defaultdict(dict)
@@ -73,9 +73,9 @@ def read_originals(settings, ss, q, result, scope, hint, until, driver):
     examined = []
     for kb, locators in by_kb.items():
         source = settings.sources[kb]
-        points = q.retrieve(source.collection, ids=list(locators), with_payload=True, with_vectors=False)
-        for point in points:
-            pid, payload = str(point.id), point.payload or {}
+        records = (store.chunks.payloads(source.collection, list(locators)).items() if store is not None else
+                   [(str(point.id), point.payload or {}) for point in q.retrieve(source.collection, ids=list(locators), with_payload=True, with_vectors=False)])
+        for pid, payload in records:
             locator = locators.get(pid)
             if (not locator or not payload.get("is_active") or payload.get("kb_id", kb) != kb
                     or payload.get("doc_id") != locator["doc_id"]
@@ -121,6 +121,6 @@ def read_originals(settings, ss, q, result, scope, hint, until, driver):
             remaining = until - time.time()
             if remaining <= 0:
                 raise TimeoutError("graph readback date lookup budget exhausted")
-            docstatus.annotate_dates(settings, added, scope, driver=driver, timeout=remaining)
+            (store.graph.annotate_dates(added, scope, timeout=remaining) if store is not None else docstatus.annotate_dates(settings, added, scope, driver=driver, timeout=remaining))
     return added, {"status": "completed" if pool else "no_candidates", "examined": examined,
                    "source_numbers": [row["n"] for row in added], "added": len(added), "tokens": used}

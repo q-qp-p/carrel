@@ -11,8 +11,7 @@ ones you can leave out.
 
 **Server.** One NVIDIA DGX Spark (GB10, 128 GB of unified memory, Ubuntu
 24.04) runs everything: the console, the search service, the scheduled
-tasks, the stores, the parser and all model servers. It has the components
-that `./deploy.sh --with-local-models` installs.
+tasks, the stores, the parser and all model servers. This installation manages its model servers separately from Carrel.
 
 **Mac.** The author's everyday computer. The documents live in an iCloud
 Drive folder named `知识库` ("knowledge base"), and the Mac pushes that
@@ -94,7 +93,7 @@ method should take care of.
 
 You do not need all of this to try Carrel.
 
-- **No GPU, or a smaller one:** leave out `--with-local-models` and point the
+- **No GPU, or a smaller one:** point the
   model endpoints at a provider. The parser also runs on the CPU. See
   [Model endpoints](configuration.md#model-endpoints).
 - **No graphs:** graphs are optional for each knowledge base. Without them

@@ -6,8 +6,8 @@ set -euo pipefail
 # KB_LOCAL_BASE_DIR (systemd injects it, interactive shells usually do not).
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${KB_LOCAL_BASE_DIR:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
-APP_DIR="$BASE_DIR/app"
-PY="$APP_DIR/.venv/bin/python"
+APP_DIR="${KB_APP_DIR:-$BASE_DIR/app}"
+PY="${KB_PYTHON:-$APP_DIR/.venv/bin/python}"
 if [[ -n "${KB_ENV_FILE:-}" ]]; then
   ENV_FILE="$KB_ENV_FILE"
 elif [[ -f "$BASE_DIR/config/knowledge-base.env" ]]; then
@@ -26,6 +26,10 @@ source "$SCRIPT_DIR/lib/kb-maint-defer.sh"
 # directories. Skipped when the container is not running.
 MINERU_OUTPUT_KEEP_MINUTES="${KB_MINERU_OUTPUT_KEEP_MINUTES:-1440}"
 mineru_output_gc() {
+  if [[ "${KB_RUNTIME:-}" == container ]]; then
+    "$PY" -c 'from kb_runtime.bootstrap import cleanup_mineru_output; cleanup_mineru_output()'
+    return
+  fi
   local name="${KB_MINERU_CONTAINER:-carrel-mineru}"
   if [[ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != "true" ]]; then
     echo "=== $(date '+%F %T') mineru-output-gc: container $name not running, skipped ==="

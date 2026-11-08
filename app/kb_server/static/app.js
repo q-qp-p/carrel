@@ -319,6 +319,7 @@ document.addEventListener("keydown", ev => {
 });
 
 function setPanel(name) {
+  if (name !== "llms") hideModelKeys();
   state.activePanel = name;
   for (const [key, sel] of Object.entries(PANELS)) $(sel).classList.toggle("show", name === key);
   for (const [key, sel] of Object.entries(PANEL_BUTTONS)) $(sel).classList.toggle("active", name === key);
@@ -326,6 +327,7 @@ function setPanel(name) {
   if (name === "health") refreshHealth();
   if (name === "llms") {
     refreshLlms();
+    window.refreshModelEndpoints?.();
     // Measure only once the panel is really visible: with display:none every width is 0 and a name would
     // be misjudged as fitting, so it would never scroll.
     scheduleNameMarquee($("#llm-win"));
@@ -600,11 +602,50 @@ function llmOptions(selectedName, { fallback = false } = {}) {
 }
 
 function vlmOptions(selectedName) {
-  const models = state.llms.filter(m => (m.protocol || "openai") === "openai");
+  const models = state.llms.filter(m => m.multimodal && (m.protocol || "openai") === "openai");
   const missing = selectedName && !models.some(m => m.name === selectedName);
   return `<option value="">${t("未选择")}</option>` +
     (missing ? `<option value="${esc(selectedName)}" selected>${esc(selectedName)} (${t("不可用")})</option>` : "") +
     models.map(m => `<option value="${esc(m.name)}" ${selectedName === m.name ? "selected" : ""}>${esc(m.name)}</option>`).join("");
+}
+
+const parseActionPending = new Map();
+
+function parseAction(kb) {
+  if (!kb || kb.state !== "active") return {kind: "start", label: "立即解析", enabled: false};
+  if (kb.parse_pausing) return {kind: "pause", label: "暂停中…", enabled: false};
+  if (kb.parse_paused) return {kind: "resume", label: "继续解析", enabled: true};
+  if (kb.jobs_running > 0) return {kind: "pause", label: "暂停解析", enabled: true};
+  const pending = (kb.jobs_queued || 0) + (kb.files_pending || 0) + (!kb.files_total ? kb.dir_files || 0 : 0);
+  return {kind: "start", label: "立即解析", enabled: pending > 0};
+}
+
+function graphAction(kb) {
+  if (!kb || kb.state !== "active" || kb.graph_status === "disabled")
+    return {kind: "start", label: "立即建图", enabled: false};
+  if (kb.graph_status === "running") return {kind: "pause", label: "暂停建图", enabled: true};
+  const gb = kb.graph_build || {};
+  const paused = kb.graph_paused || gb.paused || kb.graph_status === "stopped";
+  const halted = paused || kb.graph_status === "failed";
+  const blocked = (kb.jobs_active || 0) > 0 || kb.schema_task?.status === "running" || !!kb.schema_suggest;
+  const ready = paused && !["stopped", "failed"].includes(kb.graph_status) ? true
+    : halted ? gb.cache_reusable === true
+    : ["build", "append"].includes(kb.rebuild_check?.manual_run?.kind);
+  return {kind: paused ? "resume" : "start", label: paused ? "继续建图" : "立即建图", enabled: !blocked && ready};
+}
+
+function renderPipelineActions(kb) {
+  const parse = parseAction(kb), graph = graphAction(kb);
+  const parsingRequest = parseActionPending.has(kb?.kb_id);
+  const graphRequest = buildStarting;
+  $("#cfg-parse-now").textContent = t(parsingRequest ? (parseActionPending.get(kb?.kb_id) === "pause" ? "暂停中…" : "启动中…") : parse.label);
+  $("#cfg-parse-now").disabled = !parse.enabled || parsingRequest;
+  $("#cfg-gbuild").textContent = t(graphRequest ? (graphPendingAction === "pause" ? "暂停中…" : "启动中…") : graph.label);
+  $("#cfg-gbuild").disabled = !graph.enabled || graphRequest;
+  $("#cfg-reparse").disabled = !kb || kb.state !== "active" || kb.parse_paused || parsingRequest;
+  $("#cfg-grebuild").disabled = !kb || kb.state !== "active" || !$("#cfg-graph").checked
+    || kb.graph_status === "running" || (kb.jobs_active || 0) > 0 || graphRequest
+    || kb.schema_task?.status === "running" || !!kb.schema_suggest;
 }
 
 async function renderConfig() {
@@ -634,10 +675,9 @@ async function renderConfig() {
     $("#cfg-save").disabled = true;
     $("#cfg-parse-now").disabled = true;
     $("#cfg-reparse").disabled = true;
-    $("#cfg-parse-pause").disabled = true;
     $("#cfg-gsave").disabled = true;
     $("#cfg-gbuild").disabled = true;
-    $("#cfg-gappend").disabled = true;
+    $("#cfg-grebuild").disabled = true;
     $("#cfg-gdelete").disabled = true;
     $("#cfg-delete").disabled = true;
     $("#cfg-graph").checked = false;
@@ -648,6 +688,13 @@ async function renderConfig() {
   }
 
   const active = kb.state === "active";
+  const key = `${kb.dir}|${draft ? "draft" : kb.state}`;
+  // Initialize both switches from the same overview before the form is painted.
+  // Waiting for config/models shows a false off-to-on transition on refresh.
+  // Preserve an already loaded form and its unsaved graph selection on re-fetch.
+  if (!state.toggling && state.cfgKey !== key && !(active && formBase?.dir === kb.dir)) {
+    $("#cfg-graph").checked = active && !!kb.graph_status && kb.graph_status !== "disabled";
+  }
   if (!active) draftCache.delete(kb.dir);   // a draft is unsaved edits of an enabled KB: once it is closed, deleted or not yet enabled, it must not be filled back in when the KB is enabled next
   if (active) {
     stats.innerHTML = `<span>${t("文件")} <b>${kb.files_total || kb.dir_files || 0}</b>${!kb.files_total && kb.dir_files ? `<span class="muted">(${t("等待扫描登记")})</span>` : ""}</span>
@@ -679,10 +726,7 @@ async function renderConfig() {
   // The action row is permanent and never adds or removes controls per state: unavailable ones are greyed
   // out, so the template stays the same in every state
   $("#cfg-save").disabled = !(active || draft);
-  $("#cfg-parse-now").disabled = !active || kb.parse_pausing;
-  $("#cfg-reparse").disabled = !active || kb.parse_paused;
-  $("#cfg-parse-pause").disabled = !active || kb.parse_paused;
-  $("#cfg-parse-pause").textContent = t(kb.parse_pausing ? "暂停中…" : "暂停解析");
+  renderPipelineActions(kb);
   // Graph save button: enabled when the switch is on, or the saved state is on (to persist turning it off);
   // the build button only when the switch is on
   const savedGraphOn = !!(kb.graph_status && kb.graph_status !== "disabled");
@@ -690,23 +734,10 @@ async function renderConfig() {
   const building = kb.graph_status === "running";
   const paused = kb.graph_status === "stopped";
   const halted = paused || kb.graph_status === "failed";
-  $("#cfg-gbuild").disabled = !(active && $("#cfg-graph").checked) || building;   // no build without the graph turned on
-  // Appending needs a completed graph; a KB whose last append stopped midway (paused or failed) while a built
-  // version is still live can append as well, a KB that was never built can only do a full build
-  const liveGraph = kb.graph_status === "ok" || (halted && !!(kb.graph_build || {}).active_graph_version);
-  $("#cfg-gappend").disabled = !(active && $("#cfg-graph").checked && liveGraph) || building;
-  // For a KB stopped midway (paused or failed), "build" may mean "carry on" -- but only when the cache can
-  // really be resumed. The cache key includes model and messages: labels re-extracted, build model
-  // switched or chunking parameters changed and the old cache is entirely missed; clicking then means a
-  // full re-run of several hours, which must not be called "Resume". The server compares the fingerprint
-  // taken at build start with the current config in _paused_cache_reuse; completed phases
-  // (graph_build_phases) are skipped wholesale when resuming.
+  // Resuming reuses completed phases and cached calls. If configuration or content changed,
+  // the server refuses to resume and asks for an explicit full rebuild instead.
   const gb = kb.graph_build || {};
-  // What stopped midway was an append and a built version is still live: carrying on means appending once
-  // more (the same rule as trigger_graph_build on the server)
-  const resumeAppend = halted && gb.build_kind === "append" && !!gb.active_graph_version;
-  const canResume = halted && (resumeAppend || gb.cache_reusable === true);
-  $("#cfg-gbuild").textContent = t(resumeAppend ? "继续并入" : canResume ? "继续建图" : "立即/重新建图");
+  const canResume = halted && gb.cache_reusable === true;
   const parts = savedGraphOn ? rebuildProgressParts(kb.rebuild_check) : { time: "", fresh: "" };
   for (const [id, text] of [["#cfg-ri-progress", parts.time], ["#cfg-rp-progress", parts.fresh]]) {
     const el = $(id);
@@ -718,11 +749,10 @@ async function renderConfig() {
     const cache = gb.cache_entries ? t("缓存 {0} 条可续用", gb.cache_entries) : "";
     const text = canResume
       ? [phases, cache].filter(Boolean).join(" · ")
-      : (halted && gb.cache_stale ? t("{0},缓存不可续用,这次是从头建", t(gb.cache_stale)) : "");
+      : (halted && gb.cache_stale ? t("{0},请使用「整库重新建图」", t(gb.cache_stale)) : "");
     gnote.textContent = text;
     gnote.style.display = text ? "inline-block" : "none";   // .note is hidden by default in the stylesheet; clearing the value would not show it
   }
-  $("#cfg-gpause").disabled = !(active && building);
   // Allow deletion whenever artifacts exist, even with the switch already off (turned off mid-build, or the
   // last delete failed, both end up here). Looking only at graph_status would turn an existing graph into
   // an orphan that cannot be cleaned up.
@@ -733,7 +763,6 @@ async function renderConfig() {
   $("#cfg-delete").disabled = !(kb.kb_id && !draft) || kb.state === "deleting";
 
   if (state.toggling) return;   // switch request in flight: do not let polling flick it back for a moment
-  const key = `${kb.dir}|${draft ? "draft" : kb.state}`;
   if (state.cfgKey !== key) {
     state.cfgKey = key;
     schemaResultApplied = "";
@@ -889,7 +918,7 @@ $("#cfg-graph").addEventListener("change", async ev => {
   const activeKb = kb && kb.state === "active";
   const savedOn = !!(kb && kb.graph_status && kb.graph_status !== "disabled");
   $("#graph-fields").disabled = !on;
-  $("#cfg-gbuild").disabled = !(activeKb && on);
+  renderPipelineActions(kb);
   $("#cfg-gsave").disabled = !(activeKb && (on || savedOn));
   // 只在拨开时算。拨关时先不动这句提示 —— 下面还有确认框,取消了的话什么都
   // 没发生,提示不该被清掉;真关成了在后面清。
@@ -939,7 +968,7 @@ $("#cfg-graph").addEventListener("change", async ev => {
     // does not lie
     ev.target.checked = true;
     $("#graph-fields").disabled = false;
-    $("#cfg-gbuild").disabled = !activeKb;
+    renderPipelineActions(kb);
     $("#cfg-gsave").disabled = !activeKb;
     toast(t("关闭失败: ") + t(e.message));
   } finally {
@@ -1164,26 +1193,23 @@ $("#cfg-save").addEventListener("click", async () => {
   await refreshOverview();
 });
 
-$("#cfg-parse-pause").addEventListener("click", async ev => {
-  const kb = selectedEntry();
-  if (!kb || kb.state !== "active" || kb.parse_paused) return;
-  ev.currentTarget.disabled = true;
-  try {
-    const result = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/parse_pause`, { method: "POST" });
-    toast(t(result.pausing ? "暂停中…" : "解析已暂停"));
-  } catch (e) { toast(t("暂停失败: ") + t(e.message)); }
-  await refreshOverview();
-});
-
 $("#cfg-parse-now").addEventListener("click", async () => {
-  const kb = selectedEntry();
-  if (!kb || kb.state !== "active") return;
+  const kb = selectedEntry(), action = parseAction(kb);
+  if (!action.enabled || parseActionPending.has(kb.kb_id)) return;
+  parseActionPending.set(kb.kb_id, action.kind);
+  renderPipelineActions(kb);
   try {
-    const result = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/parse_now`, { method: "POST", body: {} });
-    toast(t(result.resumed ? "已继续解析" : "已触发扫描:空库全量解析,已有内容则处理增量文件"));
-    setTab("files");
-  } catch (e) { toast(t("触发失败: ") + t(e.message)); }
-  await refreshOverview();   // saves nothing, so it must not roll back unsaved edits either
+    const endpoint = action.kind === "pause" ? "parse_pause" : "parse_now";
+    const result = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/${endpoint}`, { method: "POST", body: {} });
+    toast(t(action.kind === "pause" ? (result.pausing ? "暂停中…" : "解析已暂停")
+      : result.resumed ? "已继续解析" : "已触发扫描:空库全量解析,已有内容则处理增量文件"));
+    if (action.kind !== "pause" && selectedEntry()?.kb_id === kb.kb_id) setTab("files");
+  } catch (e) { toast(t("操作失败: ") + t(e.message)); }
+  finally {
+    await refreshOverview();
+    parseActionPending.delete(kb.kb_id);
+    renderPipelineActions(selectedEntry());
+  }
 });
 
 // Changing the version only changes a pending selection: labels and language follow immediately (preview),
@@ -1202,61 +1228,71 @@ $("#cfg-gsave").addEventListener("click", async () => {
   try {
     await api(`/kbs/${encodeURIComponent(kb.kb_id)}/config`, { method: "PUT", body: collectGraphConfig() });
     markGraphConfigSaved();            // persisted, clear the "unsaved" hint
-    toast(t("图谱配置已保存;建图由自动重建条件或「立即/重新建图」触发"));
+    toast(t("图谱配置已保存,按自动策略运行,也可手动开始或继续"));
   } catch (e) { toast(t("保存失败: ") + t(e.message)); }
   await refreshOverview();
 });
 
-let buildStarting = false;          // no second click while the request is in flight (final review F03: during preparation there is no running record yet, so the backend lock alone cannot block a duplicate submit)
-$("#cfg-gbuild").addEventListener("click", async () => {
+let buildStarting = false;          // start, pause and rebuild share one in-flight guard
+let graphPendingAction = "";
+async function startGraphBuild(mode) {
   if (buildStarting) return;
   const kb = selectedEntry();
   if (!kb || kb.state !== "active") return;
   if ((kb.jobs_active || 0) > 0) { await noticeDialog(PARSE_BUSY_MSG); return; }
+  if (mode === "rebuild") {
+    const ok = await confirmDialog(
+      t("重新构建「{0}」的全部图谱?\n\n新版本完成后替换当前图谱,不会继续上次的建图进度。", kb.dir),
+      t("整库重新建图"));
+    if (!ok) return;
+  }
+  if (buildStarting) return;
   buildStarting = true;
-  $("#cfg-gbuild").disabled = true;
+  graphPendingAction = mode;
+  renderPipelineActions(selectedEntry());
   try {
-    // The button looks at the switch and model selection on the page (possibly unsaved); the backend looks
-    // at the saved config. Submit this section's draft first, then trigger, to avoid "button clickable but
-    // the backend says the graph is off" or "building with the old model".
+    // Persist the graph form before choosing run/resume/append from current server state.
     await api(`/kbs/${encodeURIComponent(kb.kb_id)}/config`, { method: "PUT", body: collectGraphConfig() });
     if (selectedEntry()?.kb_id === kb.kb_id) markGraphConfigSaved();
-    await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_build`, { method: "POST", body: {} });
-    toast(t("图谱配置已保存,建图已启动"));
+    const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_build`, { method: "POST", body: { mode } });
+    toast(r.started === false ? t("暂无待建图内容")
+      : r.append ? t("并入已启动:") + deltaText(r.delta || {}) : t("图谱配置已保存,建图已启动"));
   } catch (e) { toast(t("建图启动失败: ") + t(e.message)); }
-  finally { buildStarting = false; }
-  await refreshOverview();
-});
+  finally {
+    await refreshOverview();
+    buildStarting = false;
+    graphPendingAction = "";
+    renderPipelineActions(selectedEntry());
+  }
+}
 
-$("#cfg-gappend").addEventListener("click", async () => {
-  const kb = selectedEntry();
-  if (!kb || kb.state !== "active") return;
-  if ((kb.jobs_active || 0) > 0) { await noticeDialog(PARSE_BUSY_MSG); return; }
-  try {
-    // Same as "Build / rebuild now": submit this section's draft first, the backend decides from the saved
-    // config whether an append is possible
-    await api(`/kbs/${encodeURIComponent(kb.kb_id)}/config`, { method: "PUT", body: collectGraphConfig() });
-    markGraphConfigSaved();
-    const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_append`, { method: "POST", body: {} });
-    toast(t("并入已启动:") + deltaText(r.delta || {}));
-  } catch (e) { toast(t("并入启动失败: ") + t(e.message)); }
-  await refreshOverview();
-});
-
-$("#cfg-gpause").addEventListener("click", async ev => {
-  const kb = selectedEntry();
-  if (!kb || kb.state !== "active") return;
+async function pauseGraphBuild(kb) {
+  if (buildStarting) return;
   const ok = await confirmDialog(
     t("暂停「{0}」的建图?\n\n进度与缓存保留。暂停期间改模型、标签、谓词、语言或合并切片数会使缓存失效。", kb.dir),
     t("暂停建图"));
-  if (!ok) return;
-  ev.target.disabled = true;
+  if (!ok || buildStarting) return;
+  buildStarting = true;
+  graphPendingAction = "pause";
+  renderPipelineActions(selectedEntry());
   try {
     const r = await api(`/kbs/${encodeURIComponent(kb.kb_id)}/graph_pause`, { method: "POST" });
     toast(t("已暂停 · 缓存 {0} 条可复用", r.cache_entries || 0));
   } catch (e) { toast(t("暂停失败: ") + t(e.message)); }
-  await refreshOverview(true);
+  finally {
+    await refreshOverview(true);
+    buildStarting = false;
+    graphPendingAction = "";
+    renderPipelineActions(selectedEntry());
+  }
+}
+
+$("#cfg-gbuild").addEventListener("click", () => {
+  const kb = selectedEntry(), action = graphAction(kb);
+  if (!action.enabled || buildStarting) return;
+  return action.kind === "pause" ? pauseGraphBuild(kb) : startGraphBuild("run");
 });
+$("#cfg-grebuild").addEventListener("click", () => startGraphBuild("rebuild"));
 
 $("#cfg-gvdel").addEventListener("click", async () => {
   const kb = selectedEntry();
@@ -1373,7 +1409,7 @@ function syncTuneButton(kb) {
   btn.disabled = running;
   if (running) {
     $("#cfg-gbuild").disabled = true;
-    $("#cfg-gappend").disabled = true;
+    $("#cfg-grebuild").disabled = true;
   }
   btn.textContent = running ? t("抽取中…") : t("立即/重新抽取标签");
   cancel.hidden = !(task?.status === "running");
@@ -3239,6 +3275,11 @@ async function _refreshHealth() {
   const body = $("#health-body");
   try {
     const h = await api("/health");
+    $("#btn-health").hidden = h.system_services === false;
+    if (h.system_services === false) {
+      body.replaceChildren();
+      return;
+    }
     state.health = h;      // lets the restart button tell whether the service has turned green
     // Only managed rows (KB_CONSOLE_SERVICES) get a restart button; for the four unmanaged model rows the
     // backend returns null and the row does not appear
@@ -3439,7 +3480,8 @@ function renderLlmView(div, m) {
       </span>
     </div>
     <div class="llm-meta">${esc(m.model_id || "")}<br>${esc(m.base_url || "")}${m.protocol === "anthropic" ? " · anthropic" : ""}<br>
-      ${t("最大输入")}: ${m.max_input_tokens ? fmtNum(m.max_input_tokens) + " tokens" : t("未设置")}</div>`;
+      ${t("最大输入")}: ${m.max_input_tokens ? fmtNum(m.max_input_tokens) + " tokens" : t("未设置")}<br>
+      ${t("请求并发")}: ${m.concurrency}${m.multimodal ? " · " + t("多模态") : ""}</div>`;
   scheduleNameMarquee(div);
   div.querySelector(".c-edit").addEventListener("click", () => {
     renderLlmForm(div, m);
@@ -3467,8 +3509,12 @@ function renderLlmView(div, m) {
 function renderLlmForm(div, m) {
   const isNew = !m;
   div.innerHTML = `
-    <div class="fld"><label class="f">${t("名称")}${isNew ? t("(唯一,保存后不可改)") : ""}</label>
-      <input type="text" class="c-name" placeholder="${t("如 deepseek-v3")}" value="${m ? esc(m.name) : ""}" ${isNew ? "" : "readonly"}></div>
+    <div class="llm-form-row">
+      <div class="fld"><label class="f">${t("名称")}${isNew ? t("(唯一,保存后不可改)") : ""}</label>
+        <input type="text" class="c-name" placeholder="${t("如 deepseek-v3")}" value="${m ? esc(m.name) : ""}" ${isNew ? "" : "readonly"}></div>
+      <div class="fld"><label class="f">Model ID</label>
+        <input type="text" class="c-model mono" placeholder="${t("如 deepseek-chat")}" value="${m ? esc(m.model_id) : ""}"></div>
+    </div>
     <div class="fld"><label class="f">${t("接口协议")}</label>
       <select class="c-proto">
         <option value="openai" ${!m || m.protocol !== "anthropic" ? "selected" : ""}>${t("OpenAI 兼容(/chat/completions)")}</option>
@@ -3476,17 +3522,23 @@ function renderLlmForm(div, m) {
       </select></div>
     <div class="fld"><label class="f">Base URL</label>
       <input type="text" class="c-base mono" placeholder="http://127.0.0.1:8000/v1" value="${m ? esc(m.base_url) : ""}"></div>
-    <div class="fld"><label class="f">Model ID</label>
-      <input type="text" class="c-model mono" placeholder="${t("如 deepseek-chat")}" value="${m ? esc(m.model_id) : ""}"></div>
-    <div class="fld"><label class="f">${t("最大输入")}</label>
-      <input type="number" class="c-max-input mono" aria-label="${t("最大输入")}" min="1" max="2147483647" step="1" required placeholder="1048576" value="${m?.max_input_tokens || ""}">
-      <div class="hint">${t("单位:tokens。标签抽取的单次输入预算为此值的 30%。")}</div></div>
     <div class="fld"><label class="f">API Key</label>
       <input class="c-key mono" type="password" autocomplete="new-password" placeholder="${m && m.has_api_key ? t("已配置,留空保持不变") : t("本地服务可留空")}"></div>
+    <div class="llm-form-row llm-form-limits">
+      <div class="fld"><label class="f">${t("最大输入（token）")}</label>
+        <input type="number" class="c-max-input mono" aria-label="${t("最大输入（token）")}" min="1" max="2147483647" step="1" required placeholder="1048576" value="${m?.max_input_tokens || ""}"></div>
+      <div class="fld"><label class="f">${t("请求并发")}</label>
+        <input type="number" class="c-concurrency mono" aria-label="${t("请求并发")}" min="1" max="256" step="1" required value="${m?.concurrency || 1}"></div>
+      <div class="fld llm-form-multimodal"><label class="f"><input type="checkbox" class="c-multimodal" ${m?.multimodal ? "checked" : ""}> ${t("多模态")}</label></div>
+    </div>
     <div class="c-actions">
       <button class="c-cancel">${t("取消")}</button>
       <button class="c-save primary">${t("保存")}</button>
     </div>`;
+  const keyField = attachKeyVisibility(div.querySelector(".c-key"), {
+    hasKey: !!m?.has_api_key,
+    loadKey: () => api(`/llms/${encodeURIComponent(m.name)}/key`, {method: "POST"}),
+  });
   const protoSel = div.querySelector(".c-proto"), baseInput = div.querySelector(".c-base");
   const protoHint = () => {
     baseInput.placeholder = protoSel.value === "anthropic"
@@ -3501,16 +3553,19 @@ function renderLlmForm(div, m) {
   });
   div.querySelector(".c-save").addEventListener("click", async ev => {
     ev.target.disabled = true;
-    ev.target.textContent = t("测试连通性…");
+    ev.target.textContent = t(div.querySelector(".c-multimodal").checked ? "测试图片连接…" : "测试连通性…");
     try {
       const maxInput = div.querySelector(".c-max-input");
       if (!maxInput.reportValidity()) throw new Error(t("最大输入必须是正整数(tokens)"));
+      if (!div.querySelector(".c-concurrency").reportValidity()) throw new Error(t("请求并发必须是 1 到 256 的整数"));
       await api("/llms", { method: "POST", body: {
         name: div.querySelector(".c-name").value,
         base_url: div.querySelector(".c-base").value,
         model_id: div.querySelector(".c-model").value,
         max_input_tokens: Number(div.querySelector(".c-max-input").value),
-        api_key: div.querySelector(".c-key").value,
+        multimodal: div.querySelector(".c-multimodal").checked,
+        concurrency: Number(div.querySelector(".c-concurrency").value),
+        api_key: keyField.value(),
         protocol: div.querySelector(".c-proto").value,
       } });
       toast(t("连通性测试通过,已保存"));

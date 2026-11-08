@@ -11,8 +11,7 @@ through this one. Trade-offs:
 · Circuit breaker: N consecutive failed calls (after retries are exhausted) stop the build. When the provider is
   down as a whole every retry burns money, while "come back later" is almost free: the calls already finished
   are in the cache. The criterion comes straight from call results, no more guessing from upstream logs.
-· Concurrency: a thread pool, 8 workers by default (the ceiling measured on 2026-08-25 against the two models
-  in use).
+· Concurrency: the registered model sets the thread-pool limit; dependent phases may use fewer workers.
 · Request parameters share the console/VLM compatibility policy. Explicit parameter rejections permit bounded
   retries; successful adaptations are scoped to the endpoint, model, protocol and generation settings.
 """
@@ -117,6 +116,7 @@ class LLMSpec:
     model_id: str
     protocol: str = "openai"
     max_input_tokens: int | None = None
+    concurrency: int | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "LLMSpec":
@@ -129,6 +129,7 @@ class LLMSpec:
             model_id=str(row["model_id"]),
             protocol=protocol,
             max_input_tokens=int(row["max_input_tokens"]) if "max_input_tokens" in keys and row["max_input_tokens"] else None,
+            concurrency=int(row["concurrency"]) if "concurrency" in keys and row["concurrency"] else None,
         )
 
 
@@ -471,7 +472,10 @@ class ChatClient:
         self.cache = cache or LLMCache(None)
         self.timeout = int(timeout if timeout is not None else env_int("KB_GRAPH_LLM_TIMEOUT", DEFAULT_TIMEOUT))
         self.attempts = max(1, int(attempts))
-        self.workers = max(1, int(workers if workers is not None else env_int("KB_GRAPH_LLM_CONCURRENCY", DEFAULT_WORKERS)))
+        configured_workers = spec.concurrency or DEFAULT_WORKERS
+        self.workers = max(1, int(workers if workers is not None else configured_workers))
+        if spec.concurrency is not None:
+            self.workers = min(self.workers, max(1, spec.concurrency))
         self.circuit_fails = max(0, int(circuit_fails if circuit_fails is not None else env_int("KB_GRAPH_CIRCUIT_FAILS", DEFAULT_CIRCUIT_FAILS)))
         self.max_tokens = int(max_tokens)
         self.temperature = float(temperature)
@@ -648,6 +652,8 @@ class ChatClient:
         if not items:
             return results
         workers = max(1, int(workers or self.workers))
+        if self.spec.concurrency is not None:
+            workers = min(workers, max(1, self.spec.concurrency))
         done_count = 0
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="graph-llm")
         pending = {pool.submit(fn, item): idx for idx, item in enumerate(items)}

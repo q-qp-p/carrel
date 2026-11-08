@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .storage import get_storage
+
 import gzip
 import json
 import os
@@ -106,6 +108,10 @@ def weekly_cache_cleanup(settings: Settings, *, dry_run: bool = False) -> dict[s
     keep = int(os.getenv("KB_CACHE_ROTATION_KEEP", "2"))
     pruned = prune_old_dirs(settings.runtime_dir / "history" / "cache_rotations", keep=keep, dry_run=dry_run)
     vlm_cache = prune_vlm_cache(settings.cache_dir, dry_run=dry_run)
+    native_storage = {}
+    if getattr(settings, "storage_backend", "standard") == "light":
+        from .storage.light_maintenance import compact_chunks
+        native_storage["native_storage"] = compact_chunks(get_storage(settings).chunks, dry_run=dry_run)
     return {
         "skipped": False,
         "dry_run": dry_run,
@@ -115,6 +121,7 @@ def weekly_cache_cleanup(settings: Settings, *, dry_run: bool = False) -> dict[s
         "pruned_rotations": [path.name for path in pruned],
         "vlm_cache_pruned": vlm_cache["removed"],
         "vlm_cache": vlm_cache,
+        **native_storage,
     }
 
 
@@ -159,8 +166,10 @@ def qdrant_inactive_gc(settings: Settings, *, retention_days: int, dry_run: bool
     from .vector.qdrant import client as qdrant_client
     from .vector.qdrant import delete_inactive_points_older_than
 
+    if getattr(settings, "storage_backend", "standard") == "light":
+        from .storage.light_maintenance import inactive_gc as delete_inactive_points_older_than
     cutoff_ts = int(time.time()) - retention_days * 24 * 3600
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    q = get_storage(settings).chunks if getattr(settings, "storage_backend", "standard") == "light" else qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     collections = sorted({source.collection for source in settings.sources.values()})
     deleted: dict[str, int] = {}
     errors: list[str] = []
@@ -210,10 +219,9 @@ def qdrant_graph_collection_gc(
     from .vector.qdrant import client as qdrant_client
     from .vector.qdrant import delete_old_graph_collections
 
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    store = get_storage(settings)
     source_collections = sorted({source.collection for source in settings.sources.values()})
-    result = delete_old_graph_collections(
-        q,
+    result = store.graph.collect_vectors(
         source_collections=source_collections,
         retention_days=retention_days,
         dry_run=dry_run,
@@ -239,8 +247,7 @@ def neo4j_graph_gc(
 
     from .graph.neo4j_import import delete_old_neo4j_graph_versions
 
-    result = delete_old_neo4j_graph_versions(
-        settings,
+    result = get_storage(settings).graph.collect_versions(
         sources=settings.sources.values(),
         retention_days=retention_days,
         dry_run=dry_run,
@@ -282,12 +289,13 @@ def graph_gc(settings: Settings, *, keep_latest: int | None = None, dry_run: boo
             except Exception as exc:
                 out["reconcile_error"] = repr(exc)
                 print(f"[graph-gc] reconcile stale graph builds failed: {exc!r}", file=sys.stderr, flush=True)
-        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        store = get_storage(settings)
+        q = None if getattr(settings, "storage_backend", "standard") == "light" else qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
         for key, source in sorted(settings.sources.items(), key=lambda kv: kv[1].kb_id):
             if not getattr(source, "graph_enabled", False):
                 continue
             versions: set[str] = set()
-            for target in graph_alias_targets(q, source.collection).values():
+            for target in store.graph.alias_targets(source.collection).values():
                 parsed = parse_graph_collection_name(str(target)) if target else None
                 if parsed:
                     versions.add(str(parsed["graph_version"]))
@@ -532,15 +540,21 @@ def _drop_graph_data(settings: Settings, con, *, kb_id: str, collection: str, er
     con.commit()  # Fence late label publication before touching graph storage/cache.
 
     entry: dict[str, Any] = {}
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
-    try:
-        entry["graph_qdrant"] = _drop_graph_artifacts(q, collection)
-    except Exception as exc:
-        errors.append(f"{kb_id}: graph artefact drop failed: {exc!r}")
-    try:
-        entry["neo4j"] = _drop_neo4j_projection(settings, kb_id)
-    except Exception as exc:
-        errors.append(f"{kb_id}: neo4j projection drop failed: {exc!r}")
+    if getattr(settings, "storage_backend", "standard") == "light":
+        try:
+            entry["light_graph"] = get_storage(settings).graph.drop(kb_id,collection)
+        except Exception as exc:
+            errors.append(f"{kb_id}: Light graph drop failed: {exc!r}")
+    else:
+        q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+        try:
+            entry["graph_qdrant"] = _drop_graph_artifacts(q, collection)
+        except Exception as exc:
+            errors.append(f"{kb_id}: graph artefact drop failed: {exc!r}")
+        try:
+            entry["neo4j"] = _drop_neo4j_projection(settings, kb_id)
+        except Exception as exc:
+            errors.append(f"{kb_id}: neo4j projection drop failed: {exc!r}")
     try:
         short = graph_collection_short_name(collection)
         removed: list[str] = []
@@ -659,9 +673,15 @@ def _hard_delete_kb(settings: Settings, con, *, kb_id: str, collection: str, err
 
     entry: dict[str, Any] = {}
     purge_failed = False
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    light = getattr(settings, "storage_backend", "standard") == "light"
+    store = get_storage(settings) if light else None
+    q = None if light else qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     try:
-        entry["qdrant"] = delete_qdrant_collection(q, collection)
+        if light:
+            from .storage.light_maintenance import drop_collection
+            entry["light"] = drop_collection(store.chunks, collection)
+        else:
+            entry["qdrant"] = delete_qdrant_collection(q, collection)
     except Exception as exc:
         errors.append(f"{kb_id}: qdrant drop failed: {exc!r}")
     # Graph artefacts would otherwise leak forever: the graph GCs only
@@ -669,7 +689,8 @@ def _hard_delete_kb(settings: Settings, con, *, kb_id: str, collection: str, err
     # collections, so a vanished graph-enabled KB matched neither.
     entry.update(_drop_graph_data(settings, con, kb_id=kb_id, collection=collection, errors=errors))
     try:
-        entry["opensearch"] = search_fts.delete_collection(settings.opensearch_url, collection=collection)
+        if not light:
+            entry["opensearch"] = search_fts.delete_collection(settings.opensearch_url, collection=collection)
     except Exception as exc:
         errors.append(f"{kb_id}: opensearch drop failed: {exc!r}")
     try:
@@ -978,8 +999,11 @@ def parse_assets_gc(settings: Settings, *, retention_days: int, dry_run: bool = 
     from .vector.qdrant import expired_inactive_point_ids
     from .vector.qdrant import inactive_doc_versions_older_than
 
+    if getattr(settings, "storage_backend", "standard") == "light":
+        from .storage.light_maintenance import (active_doc_point_count, delete_expired_inactive_points,
+            delete_malformed_inactive_points, expired_inactive_point_ids, inactive_doc_versions_older_than)
     cutoff_ts = int(time.time()) - retention_days * 24 * 3600
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    q = get_storage(settings).chunks if getattr(settings, "storage_backend", "standard") == "light" else qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     # settings.sources only holds active rows; the collections of deactivated KBs must keep getting
     # point-level cleanup until they are hard-deleted, otherwise a closed KB reclaims no garbage at all
     # during the whole retention period.
@@ -1212,7 +1236,9 @@ def qdrant_backfill_inactive_at(
     from .vector.qdrant import backfill_inactive_at
     from .vector.qdrant import client as qdrant_client
 
-    q = qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
+    if getattr(settings, "storage_backend", "standard") == "light":
+        from .storage.light_maintenance import backfill_inactive_at
+    q = get_storage(settings).chunks if getattr(settings, "storage_backend", "standard") == "light" else qdrant_client(settings.qdrant_url, settings.qdrant_api_key)
     collections = sorted({source.collection for source in settings.sources.values()})
     backfilled: dict[str, int] = {}
     errors: list[str] = []
@@ -1264,7 +1290,7 @@ def _busy_state(settings: Settings) -> tuple[list[str], list[str]]:
             held.append(name)
             reasons.append(f"lock exists: {lock}")
 
-    if _pgrep(str(settings.runtime_dir.parent / "app" / ".venv" / "bin" / "python") + r".*kb_pipeline.*worker"):
+    if _pgrep(os.getenv('KB_PYTHON', str(settings.runtime_dir.parent / "app" / ".venv" / "bin" / "python")) + r".*kb_pipeline.*worker"):
         reasons.append("kb_pipeline worker process running")
 
     if settings.state_db.exists():
@@ -1440,6 +1466,13 @@ def _qdrant_versions(q: Any, collection: str, doc_id: str) -> set[str] | None:
 
     from .vector.qdrant import collection_exists
 
+    from .storage.light_data import LightChunks
+    if isinstance(q, LightChunks):
+        from .storage.light_maintenance import versions
+        try:
+            return versions(q,collection,doc_id)
+        except Exception:
+            return None
     try:
         if not collection_exists(q, collection):
             return set()

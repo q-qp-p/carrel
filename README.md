@@ -23,7 +23,7 @@ Code and Codex to the retrieval service.
 
 ## Features
 
-[0.4.1 changes and upgrade steps](docs/releases/0.4.1.md)
+[0.4.2 changes and upgrade steps](docs/releases/0.4.2.md) — Light and Standard editions, container deployment, and independent model configuration.
 
 - **Document parsing:** PDF, Word, PowerPoint, spreadsheets, images, HTML,
   Markdown, notebooks, source code, and workflow files, with processing suited
@@ -60,9 +60,10 @@ flowchart LR
     A -->|Follow-up queries| R
 ```
 
-Carrel uses MinerU and native parsers for ingestion, Qdrant for vectors,
-OpenSearch for keywords, and Neo4j for graph queries. SQLite tracks files and
-tasks. Model services can run locally or through compatible hosted endpoints.
+Carrel uses MinerU and native parsers for ingestion. Standard uses Qdrant,
+OpenSearch and Neo4j; Light uses embedded LanceDB and DuckDB. SQLite tracks files
+and tasks in both editions. Model services run independently, locally or through
+compatible hosted endpoints.
 See [Architecture](docs/architecture.md) for the pipeline and retrieval design.
 
 ## Design
@@ -85,18 +86,17 @@ preserving RAG indexes.
 
 ## Requirements
 
-- Python 3.12+ and Docker 25+ with Compose v2.
+- Docker with Compose v2. Python and background scheduling run inside the application container.
 - A text embedding endpoint; a vision-language endpoint for image descriptions;
   and a chat model for knowledge graph construction, if enabled.
-- An NVIDIA GPU and NVIDIA Container Toolkit to run the optional local model
-  stack. CPU parsing is also supported. Resource needs depend on the models
-  and collection size.
+- An NVIDIA GPU and NVIDIA Container Toolkit for GPU parsing. CPU parsing is
+  also supported. Resource needs depend on the parser and collection size.
 
 | Platform | Deployment |
 |---|---|
-| Linux with NVIDIA GPU | GPU parsing and optional local model services; systemd scheduling |
+| Linux with NVIDIA GPU | GPU parsing with NVIDIA Container Toolkit; container scheduling |
 | Linux without GPU | CPU parsing; connect to model services on another host or a provider |
-| macOS with Docker Desktop | CPU containers and native Python services; arrange scheduling separately |
+| macOS with Docker Desktop | CPU parsing and application containers, including scheduling |
 | Windows | Use WSL2; native Windows deployment is not supported |
 
 [Example setup](docs/example-setup.md) describes the author's installation
@@ -109,31 +109,31 @@ on an NVIDIA DGX Spark and some lighter alternatives.
 ```bash
 git clone https://github.com/FengZhenfei/carrel.git
 cd carrel
-./deploy.sh
+./deploy.sh --standard --build
+# Or use embedded storage:
+# ./deploy.sh --light --build
 ```
 
-The script detects the host, starts the infrastructure, installs the Python
-app, and creates configuration files. On Linux with user systemd available,
-it also enables services and scheduled tasks. Other hosts receive manual
-startup commands. First startup downloads the parser models.
+The optional script prepares Compose configuration and starts the application,
+background scheduler and selected dependencies. You can also use Compose directly.
+First startup downloads MinerU parser assets. See [Container deployment](deployment/compose/README.md).
 
 ### 2. Configure model endpoints
 
-Edit `config/knowledge-base.env` to set embedding and optional reranking
-endpoints, model names, and API keys. In the console's model list, register a
-vision-capable chat endpoint and select it as the **Multimodal model** for each
-knowledge base. Images, charts and table review share this selection. A global
-vision default can also be set with `VLM_BASE_URL`, `VLM_MODEL_ID` and `VLM_API_KEY`.
+Choose **Standard** for Qdrant, OpenSearch and Neo4j, or **Light** for embedded
+LanceDB and DuckDB. The edition is fixed for that deployment directory. Both
+include MinerU; Light has no database containers. See [Storage editions](docs/storage.md).
 
-To use the four bundled embedding and reranking models, prepare their weights and deploy with
-`./deploy.sh --with-local-models`. See [Model configuration](docs/configuration.md#model-endpoints)
-and the [local model setup](deployment/compose/README.md#local-model-servers-profile-local-models).
-Restart running application services after changing their environment settings.
+In **System settings**, configure LLM, Embedding and Reranker endpoints, model IDs
+and API keys. Register a vision-capable LLM and select it as the **Multimodal model**
+for each knowledge base. Images, charts and table review share that selection.
+Models can run on your own machines or hosted platforms. Carrel does not start
+these model services or download their weights. See [Model configuration](docs/configuration.md#model-endpoints).
 
 ### 3. Add documents
 
 Open the console at **http://127.0.0.1:9800**. Put documents in
-`runtime/mirror/<folder>/`, then enable that folder in the console. Each
+`data/runtime/mirror/<folder>/`, then enable that folder in the console. Each
 enabled folder becomes a knowledge base; scheduled tasks process its files.
 
 For a knowledge graph, register a chat model with its **Max Input** in the console, select it in the
@@ -173,7 +173,8 @@ for authentication, response status, and citations.
 | [Test scope](docs/testing.md) | Shared regression contracts, deployment-specific checks, and live evaluations |
 | [Example setup](docs/example-setup.md) | The author's installation on a DGX Spark, a Mac that syncs the documents, and lighter alternatives |
 | [Docker Compose](deployment/compose/README.md) | Infrastructure, model weights, and container settings |
-| [systemd](deployment/systemd/README.md) | Linux services and timers |
+| [Container deployment](deployment/compose/README.md) | Images, scheduling, persistent data and updates |
+| [systemd](deployment/systemd/README.md) | Native/source installation |
 
 ## Data and access
 

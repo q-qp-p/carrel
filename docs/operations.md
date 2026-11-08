@@ -2,6 +2,8 @@
 
 [Home](../README.md) · English | [中文](operations.zh-CN.md)
 
+Container installations use [Compose operations](../deployment/compose/README.md#scheduling-restart-and-updates). The commands below describe native/source installations; run CLI equivalents with `docker compose exec app python -m kb_pipeline` inside the application container.
+
 Commands below assume the repository root unless a `cd` command says otherwise.
 `kb` refers to `app/.venv/bin/kb`; the package also installs a `carrel` alias.
 
@@ -71,20 +73,16 @@ For an existing 0.2 installation, follow the [0.3.0 upgrade steps](releases/0.3.
 
 | Command | Effect |
 |---|---|
-| `./deploy.sh` | Deploy using detected settings; keep existing configuration |
-| `./deploy.sh detect` | Report environment and proposed settings |
+| `./deploy.sh --build` | Build and start Compose services; keep existing configuration and data |
+| `./deploy.sh detect` | Report the host platform and available NVIDIA devices |
 | `./deploy.sh --cpu` | Request the CPU parser setup |
-| `./deploy.sh --with-local-models` | Include the optional model services; weights must be prepared |
+| `./deploy.sh --standard` | Select Qdrant, OpenSearch and Neo4j for a new deployment |
+| `./deploy.sh --light` | Select embedded LanceDB and DuckDB for a new deployment |
 | `./deploy.sh --with-pdf-images` | Install optional PDF original-image support |
-| `./deploy.sh status` | Inspect containers and console health |
+| `./deploy.sh status` | Inspect Compose containers |
 | `./deploy.sh down` | Stop/remove Compose containers while keeping data; application systemd units are separate |
-| `./deploy.sh purge` | Remove the deployment's containers, built parser images, units, and Compose configuration |
 
-`purge --images` also removes pulled images; `purge --data` deletes runtime
-data and model weights. Back up the data you want to keep before using these
-removal options.
-
-For Linux services:
+For native Linux systemd installations:
 
 ```bash
 systemctl --user list-timers 'carrel-*'
@@ -96,7 +94,7 @@ journalctl --user -u carrel-web --since -5min
 The [systemd guide](../deployment/systemd/README.md) covers installation,
 lingering, unit templates, and manual scheduling on hosts without systemd.
 The [Compose guide](../deployment/compose/README.md) covers backend selection,
-model weights, memory settings, and container logs.
+MinerU assets, data mounts, memory settings, and container logs.
 
 ## Scheduled tasks
 
@@ -216,9 +214,10 @@ before rebuilding indexes or projections.
 
 ## Development and tests
 
-`deploy.sh` installs the pinned set from `app/requirements.lock`, the versions
-the suite was run against (pytest included); by hand that is
-`app/.venv/bin/pip install -r app/requirements.lock -e app`. After a dependency
+The application image installs the pinned sets in `app/requirements.lock` and
+`app/requirements-light.lock`. For local development, use
+`app/.venv/bin/pip install -r app/requirements.lock -r app/requirements-light.lock -e 'app[light]'`.
+Install `app/requirements-pdf-images.lock` for the optional PDF image tests. After a dependency
 change, regenerate the lock from a virtual environment you have tested with
 `app/.venv/bin/python scripts/kb-lock-deps.py app/pyproject.toml --output app/requirements.lock`.
 After installing the application and test dependencies:

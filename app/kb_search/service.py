@@ -23,7 +23,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any
 
-from qdrant_client import QdrantClient
+from kb_pipeline.storage import get_storage
 
 from kb_pipeline.config import Settings, load_settings
 
@@ -34,7 +34,7 @@ from .evidence import assemble_sources, doc_aggs, numbered, page_rows, select_hi
 from .fusion import admit_candidates, interleave, relevance_weight, rrf_merge
 from .rerank import Reranker, rerank, rerank_images
 
-_state: dict[str, Any] = {"settings": None, "search": None, "q": None, "q_key": None, "at": 0.0, "pool": None, "pool_size": 0,
+_state: dict[str, Any] = {"settings": None, "search": None, "store": None, "at": 0.0, "pool": None, "pool_size": 0,
                           "explicit": None}       # explicit: KB_SEARCH_* keys set explicitly in the process environment (recognised on the first settings read)
 _state_lock = threading.Lock()
 SETTINGS_TTL = 60.0
@@ -77,10 +77,10 @@ def _search_env(env_file: Any) -> dict[str, str] | None:
 
 
 def runtime() -> tuple[Settings, SearchSettings, Any]:
-    """Settings and the Qdrant client, re-read once a minute: knowledge base toggles come from the state
+    """Settings and the storage adapter, re-read once a minute: knowledge base toggles come from the state
     database and KB_SEARCH_* follows the env file's current content, so changing either needs no restart.
-    The listen address / port are bound at startup and the pipeline's keys (service addresses etc.) are
-    read only at startup; those two kinds still need a restart. When the env file cannot be read for a
+    Console endpoint overrides are also refreshed here. The listen address / port and environment-only
+    pipeline settings still need a restart. When the env file cannot be read for a
     moment (it is being rewritten) the previous settings are kept: that must not reset the token and the
     parameters to their defaults."""
     with _state_lock:
@@ -94,13 +94,9 @@ def runtime() -> tuple[Settings, SearchSettings, Any]:
             # details are unchanged; no version compatibility check: that would start another thread and build
             # another HTTP client. The timeout follows the search scale rather than the 120 s used when building
             timeout = max(1, int(_state["search"].channel_timeout))
-            key = (settings.qdrant_url, settings.qdrant_api_key, timeout)
-            if _state["q"] is None or _state["q_key"] != key:
-                _state["q"] = QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key, timeout=timeout,
-                                           check_compatibility=False)
-                _state["q_key"] = key
+            _state["store"] = get_storage(settings, query_timeout=timeout, previous=_state["store"])
             _state["at"] = time.time()
-        return _state["settings"], _state["search"], _state["q"]
+        return _state["settings"], _state["search"], _state["store"]
 
 
 def _pool(ss: SearchSettings) -> ThreadPoolExecutor:
@@ -165,47 +161,28 @@ def visual_rerank_active(settings: Any, ss: Any) -> bool:
 
 
 def health() -> dict[str, Any]:
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     checks: dict[str, Any] = {}
+    backend = getattr(settings, "storage_backend", "standard")
+    store_name = "lancedb" if backend == "light" else "qdrant"
     try:
-        q.get_collections(); checks["qdrant"] = "ok"
+        store.chunks.check(); checks[store_name] = "ok"
     except Exception as exc:
-        checks["qdrant"] = f"error: {type(exc).__name__}"
+        checks[store_name] = f"error: {type(exc).__name__}"
     import importlib.util
 
     checks["pdf_images"] = "ok" if importlib.util.find_spec("pymupdf") else "unavailable: install carrel[pdf-images] (PyMuPDF) for original-resolution PDF pictures"
-    return {"ok": True, "service": "kb_search", "kbs": sorted(settings.sources), "auth": "bearer" if ss.token else "loopback-only",
+    return {"ok": True, "service": "kb_search", "storage_backend": backend, "kbs": sorted(settings.sources), "auth": "bearer" if ss.token else "loopback-only",
             "rerank": rerank_active(settings, ss), "visual": ss.visual_enabled, "visual_rerank": visual_rerank_active(settings, ss), "checks": checks}
 
 
 def catalog(force: bool = False) -> dict[str, Any]:
-    settings, ss, q = runtime()
-    entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl, force=force, driver=_graph_driver(settings))
+    settings, ss, store = runtime()
+    entries = store.catalog(ttl=ss.catalog_ttl, force=force)
     return {"kbs": catalog_mod.public_view(entries)}
 
 
-def _graph_driver(settings: Settings) -> Any:
-    """目录要读各库的图谱概览:图库没配(没设密码)就不读,目录照常。"""
-    try:
-        return channels.shared_driver(settings)
-    except Exception:
-        return None
-
-
-def _kb_filters(hint: dict[str, Any] | None, excluded: list[str] | None) -> tuple[Any, list[dict[str, Any]] | None]:
-    """一个库的召回过滤:hints 的文档 / 路径 / 版本限定,加上按时间口径不给的文档路径(docstatus.excluded_paths)。"""
-    from qdrant_client.http import models as qm
-
-    qfilter = channels.hint_filter(hint) if hint else None
-    os_filters = channels.hint_os_filters(hint) if hint else None
-    if excluded:
-        base = qfilter or channels.ACTIVE_FILTER
-        qfilter = qm.Filter(must=list(base.must or []), must_not=[qm.FieldCondition(key="rel_path", match=qm.MatchAny(any=list(excluded)))])
-        os_filters = list(os_filters or []) + [{"bool": {"must_not": [{"terms": {"rel_path": list(excluded)}}]}}]
-    return qfilter, os_filters
-
-
-def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], question: str, vector: list[float] | None,
+def _probe(settings: Settings, ss: SearchSettings, store: Any, kb_ids: list[str], question: str, vector: list[float] | None,
            identifiers: list[str], *, with_profile: bool, until: float, image_bytes: bytes | None = None,
            hint: dict[str, Any] | None = None, excluded: dict[str, list[str]] | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """便宜的两路(向量、关键词)在给定的库上并行取候选,自动路由时顺带数一份库级词法证据,视觉路的问题向量也在这一步算;
@@ -219,16 +196,15 @@ def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], qu
     jobs: dict[tuple[str, str], Future] = {}
     for kb in kb_ids:
         src = settings.sources[kb]
-        qfilter, os_filters = _kb_filters(hint, (excluded or {}).get(kb))
         if vector is not None:
-            jobs[(kb, "text")] = pool.submit(channels.vector_channel, q, src.collection, vector, limit=ss.vector_k, timeout=timeout,
-                                             query_filter=qfilter)
+            jobs[(kb, "text")] = pool.submit(store.chunks.vector_candidates, src.collection, vector, limit=ss.vector_k, timeout=timeout,
+                                             hints=hint, excluded=(excluded or {}).get(kb))
         else:
             out[kb]["channels"]["text"] = {"skipped": "embedding unavailable"}
-        jobs[(kb, "bm25")] = pool.submit(channels.bm25_channel, settings.opensearch_url, question, src.collection,
-                                         limit=ss.bm25_k, identifiers=identifiers, timeout=timeout, filters=os_filters)
+        jobs[(kb, "bm25")] = pool.submit(store.keywords.candidates, question, src.collection,
+                                         limit=ss.bm25_k, identifiers=identifiers, timeout=timeout, hints=hint, excluded=(excluded or {}).get(kb))
     if with_profile:
-        jobs[("*", "profile")] = pool.submit(channels.lexical_profile, settings.opensearch_url, question,
+        jobs[("*", "profile")] = pool.submit(store.keywords.profile, question,
                                              [settings.sources[kb].collection for kb in kb_ids], timeout=timeout)
     if ss.visual_enabled and getattr(settings, "visual_embedding_enabled", True):
         jobs[("*", "visual_vector")] = pool.submit(channels.embed_visual_query, settings, text=None if image_bytes else question,
@@ -261,8 +237,8 @@ def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], qu
         # Request carrying an image: the visual channel probes every knowledge base and its evidence
         # takes part in the selection (Codex S02)
         timeout = _left(ss.channel_timeout, until) or 1.0
-        vjobs = {kb: pool.submit(channels.visual_channel, q, settings.sources[kb].collection, profile["visual_vector"],
-                                 limit=ss.visual_k, timeout=timeout, query_filter=_kb_filters(hint, (excluded or {}).get(kb))[0])
+        vjobs = {kb: pool.submit(store.chunks.vector_candidates, settings.sources[kb].collection, profile["visual_vector"],
+                                 limit=ss.visual_k, timeout=timeout, visual=True, hints=hint, excluded=(excluded or {}).get(kb))
                  for kb in kb_ids}
         for kb, (ok, val) in _collect(vjobs, time.time() + timeout).items():
             if ok:
@@ -275,7 +251,7 @@ def _probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], qu
     return out, profile
 
 
-def _graph_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], entries: dict[str, dict[str, Any]],
+def _graph_probe(settings: Settings, ss: SearchSettings, store: Any, kb_ids: list[str], entries: dict[str, dict[str, Any]],
                  question: str, vector: list[float] | None, until: float, scope: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     """图路只在有图的库上跑(没开图谱的库自然没有这一路,不需要开关);失败或超时只跳过图路。
     问题向量传给它省一次嵌入;嵌入服务挂了就只走词法种子(Q19)。"""
@@ -290,8 +266,8 @@ def _graph_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[st
         return {kb: {"chunks": [], "skipped": BUDGET_SPENT} for kb in graph_kbs}
     pool = _pool(ss)
     scope = scope or {"mode": "current"}
-    jobs = {kb: pool.submit(channels.graph_channel, settings, settings.sources[kb], question, limit=ss.graph_k, hops=ss.graph_hops,
-                            vector=vector, lexical_only=vector is None, q=q, timeout=timeout,
+    jobs = {kb: pool.submit(store.graph.query, settings.sources[kb], question, limit=ss.graph_k, hops=ss.graph_hops,
+                            vector=vector, lexical_only=vector is None, timeout=timeout,
                             history=scope["mode"] == "history", as_of=scope["day"] if scope.get("as_of") else None,
                             include_chunks=ss.graph_mode == "fused")
             for kb in graph_kbs}
@@ -300,7 +276,7 @@ def _graph_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[st
     return out
 
 
-def _visual_probe(settings: Settings, ss: SearchSettings, q: Any, kb_ids: list[str], vector: list[float] | None,
+def _visual_probe(settings: Settings, ss: SearchSettings, store: Any, kb_ids: list[str], vector: list[float] | None,
                   probe: dict[str, dict[str, Any]], hint: dict[str, Any] | None = None, *, until: float,
                   excluded: dict[str, list[str]] | None = None) -> dict[str, Any]:
     """The visual channel (Q17) queries only the chosen knowledge bases; those already queried in the
@@ -318,8 +294,8 @@ channel is skipped."""
         elif timeout <= 0:
             out[kb] = {"skipped": BUDGET_SPENT}
         else:
-            jobs[kb] = pool.submit(channels.visual_channel, q, settings.sources[kb].collection, vector, limit=ss.visual_k, timeout=timeout,
-                                   query_filter=_kb_filters(hint, (excluded or {}).get(kb))[0])
+            jobs[kb] = pool.submit(store.chunks.vector_candidates, settings.sources[kb].collection, vector, limit=ss.visual_k, timeout=timeout,
+                                   visual=True, hints=hint, excluded=(excluded or {}).get(kb))
     for kb, (ok, val) in _collect(jobs, time.time() + timeout).items():
         out[kb] = val if ok else {"skipped": _err(val)}
     return out
@@ -355,7 +331,7 @@ def _fuse(kb: str, probe: dict[str, Any], graph: dict[str, Any] | None, visual: 
     return {"fused": fused, "channels": stats, "degraded": degraded, "graph": None if (graph or {}).get("skipped") else graph}
 
 
-def _backfill(q: Any, settings: Settings, ss: SearchSettings, cands: list[dict[str, Any]], *, until: float,
+def _backfill(store: Any, settings: Settings, ss: SearchSettings, cands: list[dict[str, Any]], *, until: float,
               degraded: list[str]) -> list[dict[str, Any]]:
     """Fill in payloads before the rerank (BM25 / graph channels carry ids only); deactivated points are
     dropped here. A knowledge base whose payloads cannot be fetched (timeout, main store unreachable) is
@@ -370,7 +346,7 @@ def _backfill(q: Any, settings: Settings, ss: SearchSettings, cands: list[dict[s
         found: dict[str, dict[str, Any]] = {}
         if need:
             try:
-                found = channels.fetch_payloads(q, settings.sources[kb_id].collection, need, timeout=_left(ss.channel_timeout, until) or 1.0)
+                found = store.chunks.payloads(settings.sources[kb_id].collection, need, timeout=_left(ss.channel_timeout, until) or 1.0)
             except Exception as exc:
                 degraded.append(f"{kb_id}:backfill: {type(exc).__name__}")
         for c in rows:
@@ -483,7 +459,7 @@ def _groups(chosen: list[str], per_kb: dict[str, dict[str, Any]], buckets: dict[
     return groups
 
 
-def _rank(settings: Settings, ss: SearchSettings, q: Any, question: str, groups: list[list[dict[str, Any]]],
+def _rank(settings: Settings, ss: SearchSettings, store: Any, question: str, groups: list[list[dict[str, Any]]],
           buckets: dict[str, Any] | None = None, *, until: float, image_query: bool = False,
           hint: dict[str, Any] | None = None, scope: dict[str, Any] | None = None,
           image_bytes: bytes | None = None) -> dict[str, Any]:
@@ -495,7 +471,7 @@ def _rank(settings: Settings, ss: SearchSettings, q: Any, question: str, groups:
                              visual_limit=ss.visual_rerank_n if visual_rerank_active(settings, ss) else 0)
     admitted = len(cands)
     degraded: list[str] = []
-    cands = _backfill(q, settings, ss, cands, until=until, degraded=degraded)
+    cands = _backfill(store, settings, ss, cands, until=until, degraded=degraded)
     if scope is not None:
         checked = []
         for cand in cands:
@@ -574,11 +550,11 @@ def _rank_text(settings: Settings, ss: SearchSettings, question: str, cands: lis
 def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: list[dict[str, Any]], *,
                until: float, image_query: bool, image_bytes: bytes | None,
                block_types: list[str] | None) -> dict[str, Any]:
-    """Parallel rankers, independent relevance gates, disjoint-list RRF.
+    """Parallel scoring with independent evidence gates and one rank per candidate.
 
-    The text model scores the shared pool as a fallback. Candidates with a valid
-    image score belong only to the image list, avoiding a double vote for the same
-    caption and image. A low image score is a rejection, not a model failure.
+    A positive image judgment uses the image lane. Otherwise a matching caption
+    can use the text lane; requests carrying pixels can also retain visual recall.
+    A low image score stays visible, but does not veto these independent signals.
     """
     copies = [{**c, "scores": dict(c.get("scores") or {})} for c in cands]
     for c in copies:
@@ -615,31 +591,45 @@ def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: lis
     text_ranked = text_out["status"] in ("ok", "floor_lowered", "below_threshold")
     floor = text_out["floor"]
     if text_ranked:
-        # Scored images leave the text branch, including its threshold decision.
-        # Missing image scores remain in that branch for the existing fallback.
+        # Image captions must not raise the floor for ordinary text. When the
+        # pool contains only scored images, retain their own text threshold.
         text_candidates = [c for c in cands if str(c["point_id"]) not in image_scores]
         if text_candidates:
             _, audit["text"]["status"], floor = _text_relevance(text_candidates, ss)
-        else:
-            audit["text"]["status"], floor = "no_candidates", None
-    text_rows, image_rows = [], []
+    text_rows, image_rows, recall_rows = [], [], []
     for c in cands:
         pid = str(c["point_id"])
+        text_accept = text_ranked and float(c.get("score_rerank") or 0) >= (floor or 0)
+        image_accept = pid in image_scores and image_scores[pid] >= ss.visual_rerank_threshold
+        # Same visual-similarity gate as the image-query path without a visual
+        # reranker. It never rescues an image for a text-only request.
+        visual_score = (c.get("scores") or {}).get("score_visual")
+        recall_accept = image_query and visual_score is not None and float(visual_score) >= 0.5
+        accepted_by = [name for name, ok in (("text", text_accept), ("visual", image_accept),
+                                           ("visual_recall", recall_accept)) if ok]
         if pid in image_scores:
             c["score_rerank_visual"] = image_scores[pid]
-            c["accepted"] = image_scores[pid] >= ss.visual_rerank_threshold
+        if image_accept or (pid in image_scores and not text_accept and not recall_accept):
+            c["accepted"] = image_accept
             c["ranking"] = {"branch": "visual"}
             image_rows.append(c)
+        elif recall_accept and not text_accept:
+            c["accepted"] = True
+            c["ranking"] = {"branch": "visual_recall"}
+            recall_rows.append(c)
         else:
-            c["accepted"] = (float(c.get("score_rerank") or 0) >= (floor or 0)) if text_ranked else None
+            c["accepted"] = text_accept if text_ranked else None
             c["ranking"] = {"branch": "text" if text_ranked else "unranked"}
             text_rows.append(c)
+        c["ranking"]["accepted_by"] = accepted_by
+    if text_ranked:
+        text_passed = any("text" in c["ranking"]["accepted_by"] for c in cands)
+        audit["text"]["status"] = ("floor_lowered" if floor is not None and floor < ss.rerank_threshold else "ok") if text_passed else "below_threshold"
     # Apply existing text refinements inside that branch, before rank fusion.
-    for c in text_rows:
-        c.pop("ranking")
+    text_rankings = {str(c["point_id"]): c.pop("ranking") for c in text_rows}
     _final_scores(text_rows, ss, reranked=text_ranked, question=question, block_types=block_types)
     for c in text_rows:
-        c["ranking"] = {"branch": "text" if text_ranked else "unranked"}
+        c["ranking"] = text_rankings[str(c["point_id"])]
     from .text import is_boilerplate
 
     for c in image_rows:
@@ -652,9 +642,10 @@ def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: lis
             factor *= ss.hint_block_boost
         c["_image_order"] = c["score_rerank_visual"] * factor
     image_rows.sort(key=lambda c: (-c["_image_order"], str(c["point_id"])))
+    recall_rows.sort(key=lambda c: (-float(c["scores"]["score_visual"]), str(c["point_id"])))
     # Rejected/unknown evidence never gets promoted merely by a high list rank.
     accepted = any(c.get("accepted") is True for c in cands)
-    lists = [text_rows, image_rows]
+    lists = [text_rows, image_rows, recall_rows]
     k = max(0, ss.rrf_k)
     for rows in lists:
         retained = [c for c in rows if c.get("accepted") is True] if accepted else rows
@@ -662,10 +653,14 @@ def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: lis
             c["ranking"]["rank"] = rank
             c["score_fusion"] = 1.0 / (k + rank)
             weight = 1.0
-            if accepted and not image_query:
-                visual = c["ranking"]["branch"] == "visual"
-                score = float(c.get("score_rerank_visual" if visual else "score_rerank") or 0)
-                threshold = ss.visual_rerank_threshold if visual else (floor or 0)
+            if accepted:
+                branch = c["ranking"]["branch"]
+                if branch == "visual_recall":
+                    score, threshold = float(c["scores"]["score_visual"]), 0.5
+                else:
+                    visual = branch == "visual"
+                    score = float(c.get("score_rerank_visual" if visual else "score_rerank") or 0)
+                    threshold = ss.visual_rerank_threshold if visual else (floor or 0)
                 weight = relevance_weight(score, threshold)
             c["ranking"]["margin_weight"] = weight
             c["score_final"] = round((k + 1) * c["score_fusion"] * weight, 6)
@@ -673,11 +668,11 @@ def _rank_dual(settings: Settings, ss: SearchSettings, question: str, cands: lis
     # Equal ranks carry no cross-model relevance comparison. Retain the original
     # recall order; only a request with pixels explicitly prefers the image lane.
     ordered.sort(key=lambda c: (-float(c.get("score_final") or 0),
-                               bool(image_query and c["ranking"]["branch"] != "visual"),
+                               bool(image_query and c["ranking"]["branch"] not in ("visual", "visual_recall")),
                                c.get("_recall_order", 0), str(c["point_id"])))
     status = "ok" if accepted else ("skipped" if any(c.get("accepted") is None for c in cands) else "below_threshold")
     audit["fusion"] = {"status": "ok", "constant": k, "accepted": sum(c.get("accepted") is True for c in cands),
-                       "method": "rank" if image_query else "rank_margin"}
+                       "method": "rank_margin"}
     return {"cands": cands, "ordered": ordered, "status": status, "error": text_out["error"], "floor": floor,
             "degraded": issues, "ranking": audit, "fusion_applied": True}
 
@@ -773,7 +768,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     if not question:
         raise ValueError("question is empty")
     scope = query_scope(history=history, as_of=as_of)
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     until = t0 + float(ss.request_budget) if ss.request_budget > 0 else float("inf")
     image_query = bool(image_bytes)
     text_profile = ss.text_discovery and not image_query
@@ -787,7 +782,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         ss = replace(ss, graph_mode="neighborhood" if ss.neighborhoods > 0 and not doc_hint else "off")
     timings: dict[str, int] = {}
     degraded: list[str] = []
-    entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl, driver=_graph_driver(settings))
+    entries = store.catalog(ttl=ss.catalog_ttl)
     by_id = {e["kb_id"]: e for e in entries}
     scope = {**scope, "graph_versions": {kb: e["graph_version"] for kb, e in by_id.items() if e.get("graph_version")}}
     stale = next((e["degraded"] for e in entries if e.get("degraded")), None)
@@ -821,7 +816,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         except Exception as exc:          # 状态库锁住、更正文件读不了:这次不按文档状态筛,照实记一条降级
             degraded.append(f"{kb}:doc_status: {type(exc).__name__}")
     t = time.time()
-    probe, profile = _probe(settings, ss, q, probed, question, vector, identifiers, with_profile=routing is None, until=until,
+    probe, profile = _probe(settings, ss, store, probed, question, vector, identifiers, with_profile=routing is None, until=until,
                             image_bytes=image_bytes, hint=doc_hint, excluded=excluded)
     timings["probe_ms"] = int((time.time() - t) * 1000)
     if routing is None:
@@ -840,15 +835,15 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     chosen = [k for k in routing["chosen"] if k in probe]
     # The graph / visual channels run only on the chosen knowledge bases, then fusion per knowledge base
     t = time.time()
-    graphs = _graph_probe(settings, ss, q, chosen, by_id, question, vector, until, scope) if ss.graph_mode == "fused" else {}
-    visuals = _visual_probe(settings, ss, q, chosen, profile.get("visual_vector"), probe, doc_hint, until=until, excluded=excluded)
+    graphs = _graph_probe(settings, ss, store, chosen, by_id, question, vector, until, scope) if ss.graph_mode == "fused" else {}
+    visuals = _visual_probe(settings, ss, store, chosen, profile.get("visual_vector"), probe, doc_hint, until=until, excluded=excluded)
     per_kb: dict[str, dict[str, Any]] = {kb: _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k, excluded=excluded.get(kb))
                                          for kb in chosen}
     timings["recall_ms"] = int((time.time() - t) * 1000)
     buckets = _detect_buckets(question, chosen, per_kb, max_buckets=ss.quota_max_buckets)
     t = time.time()
     visual_limit = min(ss.visual_rerank_n, ss.rerank_n) if visual_rerank_active(settings, ss) else 0
-    ranked = _rank(settings, ss, q, question, _groups(chosen, per_kb, buckets, ss.rerank_n, visual_limit=visual_limit),
+    ranked = _rank(settings, ss, store, question, _groups(chosen, per_kb, buckets, ss.rerank_n, visual_limit=visual_limit),
                    buckets, until=until, image_query=image_query, hint=hint_used or None, scope=scope, image_bytes=image_bytes)
     timings["rerank_ms"] = int((time.time() - t) * 1000)
     # Widening: the knowledge bases chosen by auto routing yield no decent evidence (no candidates, or
@@ -865,13 +860,13 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         else:
             t = time.time()
             if ss.graph_mode == "fused":
-                graphs.update(_graph_probe(settings, ss, q, rest, by_id, question, vector, until, scope))
-            visuals.update(_visual_probe(settings, ss, q, rest, profile.get("visual_vector"), probe, doc_hint, until=until,
+                graphs.update(_graph_probe(settings, ss, store, rest, by_id, question, vector, until, scope))
+            visuals.update(_visual_probe(settings, ss, store, rest, profile.get("visual_vector"), probe, doc_hint, until=until,
                                          excluded=excluded))
             for kb in rest:
                 per_kb[kb] = _fuse(kb, probe[kb], graphs.get(kb), visuals.get(kb), k=ss.rrf_k, excluded=excluded.get(kb))
             wide_buckets = _detect_buckets(question, chosen + rest, per_kb, max_buckets=ss.quota_max_buckets)
-            wide = _rank(settings, ss, q, question, _groups(chosen + rest, per_kb, wide_buckets, ss.rerank_n, visual_limit=visual_limit), wide_buckets, until=until,
+            wide = _rank(settings, ss, store, question, _groups(chosen + rest, per_kb, wide_buckets, ss.rerank_n, visual_limit=visual_limit), wide_buckets, until=until,
                          image_query=image_query, hint=hint_used or None, scope=scope, image_bytes=image_bytes)
             if wide["error"] and ranked["status"] == "below_threshold":
                 # The rerank after widening did not happen (timeout, budget spent): the first round's "everything
@@ -924,16 +919,16 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             context_gaps.append("budget: context skipped")
             return empty
         try:
-            return fn(q, settings.sources[str(row.get("kb_id"))].collection, row, timeout=timeout, **kw)
+            return fn(settings.sources[str(row.get("kb_id"))].collection, row, timeout=timeout, **kw)
         except Exception as exc:
             context_gaps.append(f"context: {type(exc).__name__}")
             return empty
 
     def neighbors(row: dict[str, Any], span: int) -> list[dict[str, Any]]:
-        return context_call(channels.neighbor_payloads, row, [], span=span)
+        return context_call(store.chunks.neighbors, row, [], span=span)
 
     def head_of(row: dict[str, Any]) -> dict[str, Any] | None:
-        return context_call(channels.table_head, row, None)
+        return context_call(store.chunks.table_head, row, None)
 
     sources, src_stats = assemble_sources(
         hits, budget_tokens=ss.context_tokens, neighbors=neighbors if with_context else None,
@@ -947,8 +942,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
     date_versions = scope.get("graph_versions") or {}
     if sources and _left(ss.channel_timeout, until) > 0:
         try:
-            dates = docstatus.document_dates(settings, sources, date_versions,
-                                             driver=_graph_driver(settings) if date_versions else None,
+            dates = store.graph.document_dates(sources, date_versions,
                                              timeout=_left(ss.channel_timeout, until))
             for row in sources:
                 date = dates.get((str(row.get("kb_id") or ""), str(row.get("doc_id") or "")))
@@ -967,9 +961,8 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         until = min(until, discovery_started + ss.graph_budget)
         degraded = []
     if ss.graph_mode == "discovery":
-        from kb_pipeline.graph.recall import _DeadlineClient
-        q = _DeadlineClient(q, time.monotonic() + max(0.0, until - time.time()))
-        graphs = _graph_probe(settings, ss, q, chosen, by_id, question, vector, until, scope)
+        store = store.with_deadline(time.monotonic() + max(0.0, until - time.time()))
+        graphs = _graph_probe(settings, ss, store, chosen, by_id, question, vector, until, scope)
         for kb in chosen:
             graph = graphs.get(kb) or {}
             per_kb[kb]["graph"] = None if graph.get("skipped") else graph
@@ -1013,8 +1006,8 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
                 degraded.append(f"{kb}:point_meta: budget exhausted")
                 continue
             try:
-                meta.update({pid: {**m, "kb_id": kb} for pid, m in channels.point_meta(
-                    q, settings.sources[kb].collection, sorted(want), timeout=_left(ss.channel_timeout, until)).items()})
+                meta.update({pid: {**m, "kb_id": kb} for pid, m in store.chunks.metadata(
+                    settings.sources[kb].collection, sorted(want), timeout=_left(ss.channel_timeout, until)).items()})
             except Exception as exc:
                 degraded.append(f"{kb}:point_meta: {type(exc).__name__}")
     timings["verify_ms"] = int((time.time() - t) * 1000)
@@ -1087,7 +1080,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             degraded.append("budget: spec evidence skipped")
         else:
             try:
-                degraded.extend(graphwalk.locate_facts(q, {kb: settings.sources[kb].collection for kb in chosen}, specs, sources, timeout=timeout))
+                degraded.extend(store.graph.locate_facts({kb: settings.sources[kb].collection for kb in chosen}, specs, sources, timeout=timeout))
             except Exception as exc:
                 degraded.append(f"spec_evidence: {type(exc).__name__}")
         timings["spec_evidence_ms"] = int((time.time() - t) * 1000)
@@ -1115,9 +1108,9 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
             degraded.append("budget: neighborhoods skipped")
         else:
             try:
-                job = _pool(ss).submit(graphwalk.neighborhoods, settings, {kb: settings.sources[kb] for kb in graph_kbs},
+                job = _pool(ss).submit(store.graph.neighborhoods, {kb: settings.sources[kb] for kb in graph_kbs},
                                        {kb: str(graph_versions[kb]) for kb in graph_kbs}, question, entities, limit=limit,
-                                       driver=channels.shared_driver(settings), timeout=timeout, scope=scope, **options)
+                                       timeout=timeout, scope=scope, **options)
                 ok, val = _collect({"*": job}, time.time() + timeout)["*"]
             except Exception as exc:
                 ok, val = False, exc
@@ -1179,7 +1172,6 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         result.update(leads)
         summary["graph"]["output"] = budget
     if text_profile and ss.graph_mode == "discovery":
-        from .readback import read_originals
 
         summary["primary_evidence_state"] = evidence_state
         graph_summary = summary["graph"]
@@ -1187,8 +1179,7 @@ def search(question: str, *, kbs: list[str] | None = None, top_k: int | None = N
         if graph_readback and with_context and rerank_active(settings, ss):
             started = time.time()
             if started < until:
-                job = _pool(ss).submit(read_originals, settings, ss, q, result, scope, doc_hint or {}, until,
-                                       _graph_driver(settings))
+                job = _pool(ss).submit(store.graph.read_originals, ss, result, scope, doc_hint or {}, until)
                 ok, value = _collect({"readback": job}, until)["readback"]
             else:
                 ok, value = False, TimeoutError("graph readback deadline reached")
@@ -1213,12 +1204,12 @@ def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_
             history: bool = False, as_of: str | None = None) -> dict[str, Any]:
     from kb_pipeline.graph.currency import query_scope
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     if chunk_to < chunk_from or chunk_to - chunk_from > 60:
         raise ValueError("chunk range must be ascending and at most 60 chunks")
-    rows = channels.context_range(q, settings.sources[kb_id].collection, doc_id=doc_id, chunk_from=chunk_from, chunk_to=chunk_to,
+    rows = store.chunks.context(settings.sources[kb_id].collection, doc_id=doc_id, chunk_from=chunk_from, chunk_to=chunk_to,
                                   content_version=content_version)
     from .evidence import source_row
 
@@ -1226,9 +1217,9 @@ def context(kb_id: str, doc_id: str, chunk_from: int, chunk_to: int, *, content_
     scope = query_scope(history=history, as_of=as_of)
     sources = [row for row in sources if docstatus.allowed(settings, settings.sources[kb_id], row.get("rel_path"), scope)]
     if scope.get("as_of"):
-        entries = catalog_mod.get_catalog(settings, q, ttl=ss.catalog_ttl, driver=_graph_driver(settings))
+        entries = store.catalog(ttl=ss.catalog_ttl)
         scope["graph_versions"] = {e["kb_id"]: e.get("graph_version") for e in entries}
-    sources, time_stats = docstatus.annotate_dates(settings, sources, scope, driver=_graph_driver(settings), timeout=ss.channel_timeout)
+    sources, time_stats = store.graph.annotate_dates(sources, scope, timeout=ss.channel_timeout)
     root = getattr(settings.sources[kb_id], "source_root", None)
     return {"kb_id": kb_id, "kb_name": str(root) if root else None, "doc_id": doc_id, "sources": sources,
             "time": {"mode": scope["mode"], "day": scope["day"], **time_stats},
@@ -1240,12 +1231,12 @@ def image(kb_id: str, point_id: str, *, history: bool = False, as_of: str | None
     from kb_pipeline.graph.currency import query_scope
     from . import images
 
-    settings, _, q = runtime()
+    settings, _, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     source = settings.sources[kb_id]
     scope = query_scope(history=history, as_of=as_of)
-    payload = images.locate(q, source.collection, point_id)
+    payload = store.chunks.image_payload(source.collection, point_id)
     if not docstatus.allowed(settings, source, payload.get("rel_path"), scope):
         raise KeyError("image unavailable in the requested document scope")
     return images.original_image(settings, payload)
@@ -1266,13 +1257,13 @@ def graph_neighbors(kb_id: str, *, entity: str | None = None, entity_id: str | N
     默认只给现行的关系(history / as_of 见 currency.query_scope);没开图谱的库按 404 报。"""
     from . import graphwalk
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     if not entity and not entity_id:
         raise ValueError("entity or entity_id is required")
-    return graphwalk.neighbors(settings, settings.sources[kb_id], entity=entity, entity_id=entity_id, limit=limit, types=types, direction=direction,
-                               history=history, as_of=as_of, expected_graph_version=expected_graph_version, q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+    return store.graph.neighbors(settings.sources[kb_id], entity=entity, entity_id=entity_id, limit=limit, types=types, direction=direction,
+                               history=history, as_of=as_of, expected_graph_version=expected_graph_version, timeout=ss.channel_timeout)
 
 
 def graph_entities(kb_id: str, *, types: list[str] | None = None, uppers: list[str] | None = None, kind: str = "all",
@@ -1280,11 +1271,11 @@ def graph_entities(kb_id: str, *, types: list[str] | None = None, uppers: list[s
     """按类型(含子类型)/ 上层类 / 类与实例 / 名字列实体(「全部 / 所有」类问题):带总数与翻页;没开图谱的库按 404 报。"""
     from . import graphwalk
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
-    return graphwalk.list_entities(settings, settings.sources[kb_id], types=types, uppers=uppers, kind=kind, name=name, limit=limit,
-                                   offset=offset, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+    return store.graph.entities(settings.sources[kb_id], types=types, uppers=uppers, kind=kind, name=name, limit=limit,
+                                   offset=offset, timeout=ss.channel_timeout)
 
 
 def graph_schema(kb_id: str, *, version: str | None = None, fmt: str = "json") -> dict[str, Any]:
@@ -1296,7 +1287,7 @@ def graph_schema(kb_id: str, *, version: str | None = None, fmt: str = "json") -
 
     from . import graphwalk
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     if fmt not in ("json", "yaml"):
@@ -1308,7 +1299,7 @@ def graph_schema(kb_id: str, *, version: str | None = None, fmt: str = "json") -
     built = None
     if not version:
         try:
-            _, stats = graphwalk.version_stats(channels.shared_driver(settings), kb_id, timeout=ss.channel_timeout)
+            _, stats = store.graph.stats(kb_id, timeout=ss.channel_timeout)
             built = str(stats.get("schema_version_id") or "") or None
         except Exception:
             built = None              # 图库够不着:退回选中的模式版本,不让这一项拖垮
@@ -1335,10 +1326,10 @@ def graph_stats(kb_id: str) -> dict[str, Any]:
     兜底关系占比、类型表以外的类型、时间跨度、核心主体、事实的新旧与来源。没开图谱的库按 404 报。"""
     from . import graphwalk
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
-    gv, stats = graphwalk.version_stats(channels.shared_driver(settings), kb_id, timeout=ss.channel_timeout)
+    gv, stats = store.graph.stats(kb_id, timeout=ss.channel_timeout)
     if not gv:
         raise KeyError(f"{kb_id} has no active graph")
     return {"kb_id": kb_id, "kb_name": graphwalk.kb_name(settings.sources[kb_id]), "graph_version": gv, "stats": stats}
@@ -1357,7 +1348,7 @@ def graph_facts(kb_id: str, *, subject: str | None = None, subject_id: str | Non
     rel_path 经状态库换成 doc_id(图谱里的事实只记 doc_id)。"""
     from . import graphwalk, library
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     doc_id = str(doc_id or "").strip() or None
@@ -1367,9 +1358,9 @@ def graph_facts(kb_id: str, *, subject: str | None = None, subject_id: str | Non
     if not (subject or subject_id or str(prop or "").strip() or doc_id or rel_path or conflict_only):
         raise ValueError("subject, subject_id, property, doc_id, rel_path or conflict_only is required")
     doc_id = library.resolve_doc(settings, kb_id, doc_id=doc_id, rel_path=rel_path)
-    return graphwalk.list_facts(settings, settings.sources[kb_id], subject=subject, subject_id=subject_id, prop=prop, match=match,
+    return store.graph.facts(settings.sources[kb_id], subject=subject, subject_id=subject_id, prop=prop, match=match,
                                 doc_id=doc_id, conflict_only=conflict_only, history=history, as_of=as_of, limit=limit, offset=offset,
-                                fields=FACT_FIELDS, expected_graph_version=expected_graph_version, content_version=content_version, q=q, driver=channels.shared_driver(settings), timeout=ss.channel_timeout)
+                                fields=FACT_FIELDS, expected_graph_version=expected_graph_version, content_version=content_version, timeout=ss.channel_timeout)
 
 
 def graph_pages(kb_id: str, *, kind: str | None = None, title: str | None = None, page_id: str | None = None, entity_id: str | None = None,
@@ -1379,14 +1370,14 @@ def graph_pages(kb_id: str, *, kind: str | None = None, title: str | None = None
 collection (no graph) is reported as 404, an unreachable main store as 503."""
     from . import graphwalk, library
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     doc_id = library.resolve_doc(settings, kb_id, doc_id=str(doc_id or "").strip() or None, rel_path=rel_path)
     paths = library.doc_paths(settings, kb_id)
     try:
-        return graphwalk.list_pages(settings, settings.sources[kb_id], kind=kind, title=title, page_id=page_id, entity_id=entity_id,
-                                    doc_id=doc_id, with_text=with_text, limit=limit, offset=offset, paths=paths, q=q, history=history, as_of=as_of)
+        return store.graph.pages(settings.sources[kb_id], kind=kind, title=title, page_id=page_id, entity_id=entity_id,
+                                    doc_id=doc_id, with_text=with_text, limit=limit, offset=offset, paths=paths, history=history, as_of=as_of)
     except (KeyError, ValueError):
         raise
     except Exception as exc:
@@ -1399,7 +1390,7 @@ def docs(kb_id: str, *, dir: str | None = None, name: str | None = None, include
     chunk count and the latest unresolved failure, with a total and paging."""
     from . import library
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     return library.list_docs(settings, settings.sources[kb_id], dir=dir, name=name, include_deleted=include_deleted, limit=limit,
@@ -1413,7 +1404,7 @@ def grep(kb_id: str, phrases: list[str], *, fields: list[str] | None = None, rel
     from . import library
     from kb_pipeline.graph import currency
 
-    settings, ss, q = runtime()
+    settings, ss, store = runtime()
     if kb_id not in settings.sources:
         raise KeyError(kb_id)
     if not [p for p in phrases if str(p).strip()]:
@@ -1426,8 +1417,8 @@ def grep(kb_id: str, phrases: list[str], *, fields: list[str] | None = None, rel
     # no later candidate filter that could repair a truncated exclusion list.
     excluded = docstatus.excluded_paths(settings, source, scope, max_paths=None)
     try:
-        result = library.grep(settings, source, phrases, fields=fields, rel_paths=rel_paths, doc_ids=doc_ids, doc_versions=doc_versions, limit=limit,
-                              client=channels.os_client(settings.opensearch_url), timeout=ss.channel_timeout, excluded_paths=excluded)
+        result = store.keywords.grep(source, phrases, fields=fields, rel_paths=rel_paths, doc_ids=doc_ids, doc_versions=doc_versions, limit=limit,
+                              timeout=ss.channel_timeout, excluded_paths=excluded)
     except (KeyError, ValueError, sqlite3.Error):
         raise                   # state-database errors are not the keyword index's; they go to the common error handling as they are (a lock is reported as 503)
     except Exception as exc:

@@ -179,24 +179,30 @@ needed. With no image endpoint or image candidates, the text path remains in use
   multimodal `/v1/rerank` endpoint, in batches of at most four images. The image
   stage has a 15-second budget within the whole request's deadline.
 - Each branch decides relevance independently. Images use their own threshold
-  (0.5 by default); thresholds should be checked when changing models. An image
-  scored successfully belongs only to the image branch. Each accepted branch
-  rank contributes `1 / (KB_SEARCH_RRF_K + rank)`. For text queries, a branch's
+  (0.5 by default); thresholds should be checked when changing models. A candidate
+  passing image reranking uses the image branch. Otherwise, a matching caption
+  can use the text branch. Queries containing pixels also retain visual-recall
+  candidates with similarity of at least 0.5. Each candidate uses just one branch;
+  each accepted branch rank contributes `1 / (KB_SEARCH_RRF_K + rank)`. A branch's
   distance above its own relevance threshold reduces the weight of borderline
-  matches. Confident matches retain their rank weight. Queries containing an
-  image use rank fusion, with images preferred at equal ranks.
+  matches. Strong matches retain their rank weight. This also applies to image
+  queries and visual-recall evidence: a borderline match cannot gain full weight
+  just by heading its branch. Images are preferred at equal weighted ranks.
   Fused text-query results reserve accepted evidence across selected knowledge
   bases and subject/document groups, then fill by relevance. Other paths retain
   MMR when enabled. Deduplication and context budgets continue to apply.
 - Missing images, timeouts or invalid model scores fall back to text and report
-  degradation. Low image relevance is a rejection, not a reason to restore a
-  high vector score. Block-type preferences apply inside each branch before fusion.
+  degradation. Low image scores remain visible; text evidence and image-query
+  visual recall retain their independent gates. Text-only queries do not use
+  visual similarity as a fallback. Block-type preferences apply inside each
+  reranking branch before fusion.
   Text scoring also treats missing, duplicate or invalid document scores as a
   service failure, so an incomplete response cannot masquerade as low relevance.
 
 `retrieval_summary.ranking` reports branch status and counts; its `candidates`
 field records the available, admitted and scoped pool sizes. Each source's
-`ranking` reports its branch, rank and `margin_weight`. Fusion scores are rank scores, not
+`ranking` reports its branch, rank, `margin_weight` and the gates passed in
+`accepted_by` (`text`, `visual`, `visual_recall`). Fusion scores are rank scores, not
 confidence probabilities. These retrieval changes reuse existing parsed content,
 indexes and graphs. For image retrieval and display, see the image endpoints below.
 
